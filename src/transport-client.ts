@@ -40,6 +40,43 @@ export interface TransportClientOptions {
   onTextFrame?: TextFramePolicy;
   defaultTimeoutMs?: number;
   initialMessageId?: number;
+  /**
+   * Connect-time retry policy. Default: no retry (one attempt only).
+   *
+   * This is the language mapping of the Rust crate's `RetryConfig`. It
+   * covers the *initial* `connect()` failure path — DNS / WebSocket
+   * handshake / cold-start network blips — not auto-reconnect after a
+   * dropped connection, which is the consuming SDK's responsibility
+   * (`@privchat/sdk` runs its own `ReconnectOptions` state machine on
+   * top of this transport).
+   *
+   * Default 0 retries preserves the original single-attempt behavior.
+   * Opt in by passing `{ maxRetries: N, ... }`.
+   */
+  connectRetry?: ConnectRetryOptions;
+}
+
+/**
+ * Connect-time retry policy. Mirrors Rust `msgtrans::transport::client::RetryConfig`.
+ *
+ *   - `maxRetries`: number of ADDITIONAL attempts after the first one
+ *     fails. Total attempts = `maxRetries + 1`. Default 0 (no retry).
+ *   - `initialDelayMs`: delay before the FIRST retry (i.e. after attempt #0
+ *     fails, before attempt #1). Default 100.
+ *   - `maxDelayMs`: cap applied after exponential growth. Default 10_000.
+ *   - `multiplier`: per-attempt backoff multiplier. Default 2.
+ *
+ * Delay formula for attempt `n` (1-indexed retry): `min(maxDelayMs,
+ * initialDelayMs * multiplier^(n - 1))`.
+ *
+ * Retry is unconditional — any `transport.connect()` rejection triggers
+ * a retry until `maxRetries` is exhausted. The last error is rethrown.
+ */
+export interface ConnectRetryOptions {
+  maxRetries?: number;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  multiplier?: number;
 }
 
 type ClientEvent = 'message' | 'messageSent' | 'close' | 'error';
@@ -52,6 +89,7 @@ export class TransportClient {
   private readonly messageSentListeners: Array<(info: SentInfo) => void> = [];
   private readonly closeListeners: Array<(event?: unknown) => void> = [];
   private readonly errorListeners: Array<(error: unknown) => void> = [];
+  private readonly retryOpts: Required<ConnectRetryOptions>;
 
   constructor(options: TransportClientOptions) {
     this.transport = resolveTransport(options);
@@ -59,6 +97,12 @@ export class TransportClient {
       defaultTimeoutMs: options.defaultTimeoutMs,
       initialMessageId: options.initialMessageId,
     });
+    this.retryOpts = {
+      maxRetries: options.connectRetry?.maxRetries ?? 0,
+      initialDelayMs: options.connectRetry?.initialDelayMs ?? 100,
+      maxDelayMs: options.connectRetry?.maxDelayMs ?? 10_000,
+      multiplier: options.connectRetry?.multiplier ?? 2,
+    };
 
     this.transport.onMessage((p) => this.handleIncoming(p));
     this.transport.onMessageSent((info) => this.dispatchMessageSent(info));
@@ -66,8 +110,53 @@ export class TransportClient {
     this.transport.onError((e) => this.dispatchError(e));
   }
 
-  connect(): Promise<void> {
-    return this.transport.connect();
+  /**
+   * Open the transport with optional retry-on-failure.
+   *
+   * Attempt 0 runs immediately. If it rejects and `connectRetry.maxRetries
+   * > 0`, the transport is `close()`d (defensively, to reset any
+   * mid-Connecting state that would otherwise cause subsequent
+   * `transport.connect()` calls to return the prior rejected promise),
+   * a backoff delay is applied, and another attempt is made — up to
+   * `maxRetries` additional times. The final attempt's rejection is
+   * thrown verbatim.
+   *
+   * With the default `connectRetry` (omitted / `maxRetries: 0`),
+   * behavior is identical to the original single-attempt `connect()`.
+   */
+  async connect(): Promise<void> {
+    const total = this.retryOpts.maxRetries + 1;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < total; attempt++) {
+      if (attempt > 0) {
+        // Reset transport state defensively. WebSocketTransport caches
+        // its in-flight `connectPromise` across failures; without an
+        // explicit close here, the next `connect()` would either reject
+        // with "cannot connect in state connecting" (if the prior
+        // failure hasn't drained onclose yet) or replay the already-
+        // rejected promise. `close()` is a no-op when the state is
+        // already Idle/Closed.
+        try {
+          await this.transport.close();
+        } catch {
+          // Ignore — we're about to retry; the next connect attempt
+          // will surface any real problem.
+        }
+        const delay = Math.min(
+          this.retryOpts.maxDelayMs,
+          this.retryOpts.initialDelayMs *
+            Math.pow(this.retryOpts.multiplier, attempt - 1),
+        );
+        await sleep(delay);
+      }
+      try {
+        await this.transport.connect();
+        return;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    throw lastError;
   }
 
   /** Close the underlying transport. Alias: `disconnect()`. */
@@ -298,4 +387,8 @@ function resolveTransport(options: TransportClientOptions): Transport {
 function removeFrom<T>(arr: T[], item: T): void {
   const i = arr.indexOf(item);
   if (i >= 0) arr.splice(i, 1);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -28,6 +28,7 @@ export type { RequestManagerOptions } from './request-manager.js';
 export { TransportClient, TransportContext } from './transport-client.js';
 export type {
   TransportClientOptions,
+  ConnectRetryOptions,
   SendOptions,
   RequestOptions,
 } from './transport-client.js';
