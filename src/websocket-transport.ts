@@ -156,9 +156,36 @@ export class WebSocketTransport implements Transport {
     if (max > 0 && buffered !== undefined && buffered > max) {
       return Promise.reject(new BackpressureError(buffered, max));
     }
+    // Encode OUTSIDE the socket try: an encode failure (oversized
+    // ext-header/payload) is the caller's packet problem — it must
+    // reject this send but never affect the connection.
+    let bytes: Uint8Array;
     try {
-      this.ws.send(packet.encode());
+      bytes = packet.encode();
     } catch (e) {
+      return Promise.reject(e);
+    }
+    try {
+      this.ws.send(bytes);
+    } catch (e) {
+      // ws.send() threw synchronously. Browsers throw when the socket
+      // closed mid-call (INVALID_STATE_ERR) — but the `onclose` event
+      // may lag behind, leaving this transport claiming Open against a
+      // dead socket. If readyState says the socket is no longer OPEN,
+      // drive the close path NOW (idempotent — the eventual real
+      // onclose becomes a no-op) so request managers reject pending
+      // work and reconnect state machines react immediately. A throw
+      // while readyState is still OPEN (exotic) stays a plain
+      // per-send rejection: the connection is not assumed dead.
+      const WS_OPEN = 1;
+      if (this.ws.readyState !== WS_OPEN) {
+        this.handleClose({
+          code: 1006,
+          reason: 'send failed on dead socket',
+          wasClean: false,
+          cause: e,
+        });
+      }
       return Promise.reject(e);
     }
     const info: SentInfo = { messageId: packet.messageId };
@@ -265,6 +292,11 @@ export class WebSocketTransport implements Transport {
   }
 
   private handleClose(ev: unknown): void {
+    // Idempotent: the close path can be driven twice — once synthetically
+    // by a send() that failed on a dead socket, once by the socket's own
+    // (lagging) onclose. Consumers must see close exactly once, otherwise
+    // e.g. a reconnect state machine schedules two reconnect cycles.
+    if (this._state === TransportState.Closed) return;
     const wasConnecting = this._state === TransportState.Connecting;
     this._state = TransportState.Closed;
     for (const cb of this.closeHandlers) {

@@ -115,6 +115,70 @@ describe('backpressure guard', () => {
   });
 });
 
+describe('send failure on a dead socket', () => {
+  class ThrowingSendSocket extends MockWebSocket {
+    throwOnSend: Error | null = null;
+    override send(data: ArrayBufferLike | ArrayBufferView | string): void {
+      if (this.throwOnSend) throw this.throwOnSend;
+      super.send(data);
+    }
+  }
+
+  it('drives the close path once when ws.send throws and readyState is CLOSED', async () => {
+    const m = new ThrowingSendSocket();
+    const t = await openTransport(m);
+    const closes: unknown[] = [];
+    t.onClose((ev) => closes.push(ev));
+
+    // Socket died under us: readyState flipped but onclose hasn't fired yet.
+    m.readyState = 3; // CLOSED
+    m.throwOnSend = new Error('InvalidStateError: socket is closed');
+
+    await expect(t.send(packet())).rejects.toThrow('socket is closed');
+    expect(t.state).toBe(TransportState.Closed); // no phantom Open
+    expect(closes).toHaveLength(1);
+
+    // The real (lagging) onclose arrives later — must be a no-op.
+    m.onclose?.({ code: 1006, reason: '', wasClean: false });
+    expect(closes).toHaveLength(1); // not double-fired
+  });
+
+  it('a throw while readyState is still OPEN rejects the send but keeps the connection', async () => {
+    const m = new ThrowingSendSocket();
+    const t = await openTransport(m);
+    const closes: unknown[] = [];
+    t.onClose((ev) => closes.push(ev));
+
+    m.throwOnSend = new Error('transient send failure'); // readyState stays 1
+
+    await expect(t.send(packet())).rejects.toThrow('transient send failure');
+    expect(t.state).toBe(TransportState.Open);
+    expect(closes).toHaveLength(0);
+
+    m.throwOnSend = null; // recovers
+    await t.send(packet());
+    expect(m.sent).toHaveLength(1);
+  });
+
+  it('encode failure rejects the send without touching the connection', async () => {
+    const m = new MockWebSocket();
+    const t = await openTransport(m);
+    const closes: unknown[] = [];
+    t.onClose((ev) => closes.push(ev));
+
+    const oversized = new Packet({
+      packetType: PacketType.OneWay,
+      messageId: 1,
+      extHeader: new Uint8Array(0x10000), // > MAX_EXT_HEADER_LEN (0xffff)
+      payload: new Uint8Array(),
+    });
+    await expect(t.send(oversized)).rejects.toThrow('ext_header too large');
+    expect(t.state).toBe(TransportState.Open);
+    expect(closes).toHaveLength(0);
+    expect(m.sent).toHaveLength(0); // never reached the socket
+  });
+});
+
 describe('orphan Response handling', () => {
   it('drops a Response with no pending request and reports via the error channel', async () => {
     const fake = new FakeTransport();
