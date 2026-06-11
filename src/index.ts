@@ -11,6 +11,7 @@ export type { Transport, SentInfo } from './transport.js';
 
 export {
   WebSocketTransport,
+  DEFAULT_MAX_BUFFERED_BYTES,
 } from './websocket-transport.js';
 export type {
   WebSocketLike,
@@ -38,6 +39,7 @@ export {
   UnsupportedVersionError,
   IncompletePacketError,
   TransportError,
+  BackpressureError,
   UnsupportedCompressionError,
 } from './errors.js';
 

@@ -38,6 +38,9 @@ export interface TransportClientOptions {
   protocols?: string | string[];
   webSocketFactory?: WebSocketFactory;
   onTextFrame?: TextFramePolicy;
+  /** Outbound-buffer high-water mark; see
+   *  `WebSocketTransportOptions.maxBufferedBytes`. */
+  maxBufferedBytes?: number;
   defaultTimeoutMs?: number;
   initialMessageId?: number;
   /**
@@ -239,6 +242,20 @@ export class TransportClient {
 
   private handleIncoming(packet: Packet): void {
     if (this.requestManager.handleIncoming(packet)) return;
+    // Orphan Response: a Response whose messageId matches no pending
+    // request (timed out, reset on reconnect, or a misbehaving server).
+    // Do NOT surface it as a normal message — apps would mistake it for
+    // server-pushed data. Drop it and report via the error channel so it
+    // stays observable in logs.
+    if (packet.packetType === PacketType.Response) {
+      this.dispatchError(
+        new TransportError(
+          `dropped orphan Response (messageId=${packet.messageId}, ` +
+            `bizType=${packet.bizType}): no pending request`,
+        ),
+      );
+      return;
+    }
     const ctx = new TransportContext(packet, this);
     for (const cb of this.messageListeners) {
       try {
@@ -381,6 +398,7 @@ function resolveTransport(options: TransportClientOptions): Transport {
     protocols: options.protocols,
     webSocketFactory: options.webSocketFactory,
     onTextFrame: options.onTextFrame,
+    maxBufferedBytes: options.maxBufferedBytes,
   });
 }
 

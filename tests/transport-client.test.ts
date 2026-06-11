@@ -172,11 +172,17 @@ describe('TransportClient — message routing', () => {
     expect(received).toHaveLength(0);
   });
 
-  it('Response with unknown messageId DOES surface as message (orphan response)', () => {
+  it('Response with unknown messageId is DROPPED (reported via error channel, never as message)', () => {
+    // Behavior change (robustness round): an orphan Response used to be
+    // surfaced via on('message'), where apps could mistake it for
+    // server-pushed data. It is now dropped + reported through
+    // on('error'). See tests/robustness.test.ts for the full contract.
     const t = new FakeTransport();
     const c = newClient(t);
     const received: TransportContext[] = [];
+    const errors: unknown[] = [];
     c.on('message', (ctx) => received.push(ctx));
+    c.on('error', (e) => errors.push(e));
 
     t.fireMessage(
       new Packet({
@@ -186,8 +192,8 @@ describe('TransportClient — message routing', () => {
       }),
     );
 
-    expect(received).toHaveLength(1);
-    expect(received[0]!.packetType).toBe(PacketType.Response);
+    expect(received).toHaveLength(0);
+    expect(errors).toHaveLength(1);
   });
 
   it('Request packets surface via on("message") and ctx.respond() sends a Response', async () => {

@@ -28,6 +28,28 @@ export class TransportError extends Error {
   }
 }
 
+/**
+ * Thrown by `send()` when the WebSocket's outbound buffer
+ * (`bufferedAmount`) is above the configured high-water mark. The socket
+ * is NOT closed — the connection stays healthy; the caller should back
+ * off (drop, queue, or retry later) instead of piling more bytes onto a
+ * link that isn't draining.
+ */
+export class BackpressureError extends TransportError {
+  /** Bytes currently sitting in the socket's outbound buffer. */
+  readonly bufferedAmount: number;
+  /** The high-water mark that was exceeded. */
+  readonly maxBufferedBytes: number;
+  constructor(bufferedAmount: number, maxBufferedBytes: number) {
+    super(
+      `outbound buffer over high-water mark: bufferedAmount=${bufferedAmount} > max=${maxBufferedBytes}`,
+    );
+    this.name = 'BackpressureError';
+    this.bufferedAmount = bufferedAmount;
+    this.maxBufferedBytes = maxBufferedBytes;
+  }
+}
+
 export class UnsupportedCompressionError extends WireFormatError {
   readonly compression: number;
   constructor(compression: number) {

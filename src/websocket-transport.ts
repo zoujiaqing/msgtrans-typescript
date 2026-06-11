@@ -1,5 +1,5 @@
 import { Packet } from './packet.js';
-import { TransportError } from './errors.js';
+import { BackpressureError, TransportError } from './errors.js';
 import {
   type SentInfo,
   type Transport,
@@ -9,6 +9,10 @@ import {
 export interface WebSocketLike {
   binaryType: string;
   readyState: number;
+  /** Bytes queued via send() but not yet flushed to the network.
+   *  Standard on browser/`ws` WebSockets; optional here so minimal
+   *  fakes keep working (absence disables the backpressure check). */
+  bufferedAmount?: number;
   send(data: ArrayBufferLike | ArrayBufferView | string): void;
   close(code?: number, reason?: string): void;
   onopen: ((ev: unknown) => void) | null;
@@ -38,7 +42,20 @@ export interface WebSocketTransportOptions {
    * Default: `'error'`.
    */
   onTextFrame?: TextFramePolicy;
+  /**
+   * Outbound-buffer high-water mark in bytes. When the socket's
+   * `bufferedAmount` is already above this value, `send()` rejects with
+   * `BackpressureError` instead of silently piling more bytes onto a
+   * link that isn't draining (slow network → unbounded memory growth).
+   * The connection itself is left open. Default 16 MiB; `0` disables
+   * the check (legacy behavior). Sockets that don't report
+   * `bufferedAmount` (minimal fakes) are never rejected.
+   */
+  maxBufferedBytes?: number;
 }
+
+/** Default outbound high-water mark: 16 MiB. */
+export const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
 
 function defaultWebSocketFactory(
   url: string,
@@ -130,6 +147,14 @@ export class WebSocketTransport implements Transport {
       return Promise.reject(
         new TransportError(`cannot send in state ${this._state}`),
       );
+    }
+    // Backpressure guard: reject (without closing) when the outbound
+    // buffer is already above the high-water mark. Checked BEFORE
+    // encoding so an over-pressure caller pays no encode cost.
+    const max = this.opts.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
+    const buffered = this.ws.bufferedAmount;
+    if (max > 0 && buffered !== undefined && buffered > max) {
+      return Promise.reject(new BackpressureError(buffered, max));
     }
     try {
       this.ws.send(packet.encode());
