@@ -52,7 +52,7 @@ export async function spawnServer(
   const cmd = useBinary ? prebuilt : 'cargo';
   const args = useBinary
     ? []
-    : ['run', '--quiet', '--example', options.example];
+    : ['run', '--quiet', '--example', options.example, '--features', 'flate2'];
 
   const child = spawn(cmd, args, {
     cwd: MSGTRANS_DIR,

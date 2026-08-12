@@ -3,11 +3,13 @@ export {
   PacketType,
   CompressionType,
   ReservedFlag,
+  DEFAULT_DECODE_LIMITS,
+  normalizeDecodeLimits,
 } from './packet.js';
-export type { PacketInit } from './packet.js';
+export type { PacketInit, DecodeLimits } from './packet.js';
 
 export { TransportState } from './transport.js';
-export type { Transport, SentInfo } from './transport.js';
+export type { Transport, EnqueuedInfo } from './transport.js';
 
 export {
   WebSocketTransport,
@@ -20,13 +22,14 @@ export type {
   TextFramePolicy,
 } from './websocket-transport.js';
 
-export {
-  RequestManager,
-  RequestTimeoutError,
-} from './request-manager.js';
-export type { RequestManagerOptions } from './request-manager.js';
+export { CodecRegistry, ZlibCodec } from './codec.js';
+export type { CompressionCodec } from './codec.js';
 
-export { TransportClient, TransportContext } from './transport-client.js';
+export {
+  TransportClient,
+  ClientMessage,
+  ClientRequest,
+} from './transport-client.js';
 export type {
   TransportClientOptions,
   ConnectRetryOptions,
@@ -38,14 +41,20 @@ export {
   WireFormatError,
   UnsupportedVersionError,
   IncompletePacketError,
+  UnknownWireValueError,
+  DecodeLimitError,
   TransportError,
   BackpressureError,
   UnsupportedCompressionError,
+  IdExhaustedError,
+  RequestTimeoutError,
 } from './errors.js';
 
 export {
   FIXED_HEADER_LEN,
   PROTOCOL_VERSION,
-  MAX_EXT_HEADER_LEN,
-  MAX_PAYLOAD_LEN,
+  WIRE_MAX_EXT_HEADER_LEN,
+  WIRE_MAX_PAYLOAD_LEN,
+  DEFAULT_MAX_PAYLOAD_LEN,
+  DEFAULT_MAX_EXT_HEADER_LEN,
 } from './constants.js';

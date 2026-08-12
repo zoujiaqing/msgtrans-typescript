@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # Unit tests include the wire-format fixtures (byte-identical frames
+      # shared with the Rust repo) and the 2.0 semantics regression suite.
+      - run: npm test
+      - run: npm run build
+      # Public API snapshot: any surface change must be committed together
+      # with its regenerated api-report.txt.
+      - run: npm run api-report
+      - name: public API drift check
+        run: git diff --exit-code api-report.txt

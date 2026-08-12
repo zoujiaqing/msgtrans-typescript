@@ -4,7 +4,16 @@ TypeScript client runtime for the [msgtrans](https://github.com/zoujiaqing/msgtr
 
 `@msgtrans/client` is the language mapping of the `msgtrans` Rust client surface — same Packet semantics, same Request/Response correlation rules, same wire bytes. The wire format is defined by [`WIRE_FORMAT.md`](https://github.com/zoujiaqing/msgtrans/blob/main/docs/WIRE_FORMAT.md) and conformance is verified by a shared cross-language fixture suite.
 
-> **Status: 0.1.0-beta.0.** Protocol layer + WebSocket transport + request/response are stable and fixture-verified end-to-end against the Rust server. Heartbeat, automatic reconnection, and compression are on the roadmap.
+> **Status: 0.2.0-beta.0** — the msgtrans **2.0 semantic alignment**: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
+>
+> **Compatibility matrix**
+>
+> | @msgtrans/client | msgtrans (Rust) | Wire protocol |
+> |---|---|---|
+> | 0.2.x | 2.0.x | v1 |
+> | 0.1.x | 1.0.x / 2.0.x | v1 |
+>
+> The version numbers deliberately do NOT lock step with the Rust crate: this is a browser, single-connection client, not a full mapping of the Rust server architecture. What IS aligned: the wire format, the request lifecycle, strict decoding, and the error semantics.
 
 ## Install
 
@@ -45,19 +54,24 @@ await client.disconnect();
 ## Receiving server-pushed messages
 
 ```ts
-client.on('message', async (ctx) => {
-  if (ctx.isRequest) {
-    // Server is asking us something; respond with the same messageId.
-    const answer = await handle(ctx.bizType, ctx.data);
-    await ctx.respond(answer);
-  } else {
-    // Server-pushed OneWay event.
-    handleEvent(ctx.bizType, ctx.data);
-  }
+client.on('message', (msg) => {
+  // Server-pushed OneWay event — always plaintext (inbound compression is
+  // undone before delivery).
+  handleEvent(msg.bizType, msg.data);
 });
 
-client.on('messageSent', ({ messageId }) => {
-  // Fired after every successful transport-level send (OneWay, Request, Response).
+client.on('request', async (req) => {
+  // Server is asking us something; respond with the same messageId.
+  // Answers at most once, and only onto the connection generation it
+  // arrived on.
+  const answer = await handle(req.bizType, req.data);
+  await req.respond(answer);
+});
+
+client.on('messageEnqueued', ({ messageId }) => {
+  // Fired when a packet was ACCEPTED by the socket's outbound buffer.
+  // Deliberately NOT called "sent": a browser WebSocket cannot confirm a
+  // write reached the network, and this API does not pretend it can.
 });
 
 client.on('close', (event) => {
@@ -112,23 +126,28 @@ client.isConnected(): boolean;
 client.send(payload: Uint8Array, options?: SendOptions): Promise<void>;
 client.request(payload: Uint8Array, options?: RequestOptions): Promise<Uint8Array>;
 
-// Lower level — full Packet control:
-client.sendPacket(packet: Packet): Promise<void>;
-client.requestPacket(packet: Packet, options?: RequestOptions): Promise<Packet>;
+// There is deliberately NO lower-level packet send: message ids belong to
+// the transport (a caller-numbered Request could complete a different
+// pending waiter that drew the same id — the ABA the Rust 2.0 registry
+// closed). `Packet` stays exported for codecs/fixtures/custom Transports.
 
 // Events (each returns an unsubscribe function)
-client.on('message',     (ctx: TransportContext) => void): () => void;
-client.on('messageSent', (info: { messageId: number }) => void): () => void;
-client.on('close',       (event?: unknown) => void): () => void;
-client.on('error',       (error: unknown) => void): () => void;
+client.on('message',         (msg: ClientMessage) => void): () => void;
+client.on('request',         (req: ClientRequest) => void): () => void;
+client.on('messageEnqueued', (info: { messageId: number }) => void): () => void;
+client.on('close',           (event?: unknown) => void): () => void;
+client.on('error',           (error: unknown) => void): () => void;
 ```
 
 ```ts
 interface SendOptions {
   bizType?: number;
   extHeader?: Uint8Array;
-  reserved?: number;
-  compression?: CompressionType;     // only CompressionType.None in v0.1
+  compression?: CompressionType;     // Zlib works out of the box (native
+                                     // streams); Zstd via an injected codec.
+                                     // No codec => the send REJECTS — a raw
+                                     // payload is never shipped under a
+                                     // compressed header.
 }
 
 interface RequestOptions extends SendOptions {
@@ -136,7 +155,7 @@ interface RequestOptions extends SendOptions {
 }
 ```
 
-`TransportContext` exposes `data: Uint8Array`, `bizType: number`, `messageId: number`, `packetType`, `isRequest: boolean`, `hasResponded: boolean`, and `respond(payload, options?: SendOptions)` — the latter is only valid on Request packets and reuses the original `messageId`.
+`ClientMessage` (OneWay) exposes `payload`/`data`, `bizType`, `messageId`, `extHeader` — and no `respond` at all: the split is typed, not a runtime flag. `ClientRequest` adds `respond(payload, options?)`, which answers at most once, reuses the original `messageId`, and refuses to write onto a later connection generation (a stale response after a reconnect could complete a different server-side request that drew the same id).
 
 ## Rust ↔ TypeScript mapping
 
@@ -148,13 +167,14 @@ interface RequestOptions extends SendOptions {
 | `client.connect().await?` | `await client.connect()` |
 | `client.disconnect().await?` | `await client.disconnect()` (or `client.close()`) |
 | `client.is_connected().await` | `client.isConnected()` (sync) |
-| `client.send_with_options(bytes, TransportOptions::new().with_biz_type(5).with_ext_header(...))` | `client.send(bytes, { bizType: 5, extHeader: ... })` |
-| `client.request_with_options(bytes, TransportOptions::new().with_biz_type(100).with_timeout(d))` | `client.request(bytes, { bizType: 100, timeoutMs: 10_000 })` |
-| `subscribe_events()` → `ClientEvent::MessageReceived(ctx)` | `client.on('message', ctx => ...)` |
-| `ClientEvent::MessageSent { message_id }` | `client.on('messageSent', ({ messageId }) => ...)` |
+| `client.send_with_options(bytes, SendOptions::new().biz_type(5))` | `client.send(bytes, { bizType: 5 })` |
+| `client.request_with_options(bytes, RequestOptions::new().timeout(d))` | `client.request(bytes, { timeoutMs: 10_000 })` |
+| `ClientEvent::Message(msg)` | `client.on('message', msg => ...)` |
+| `ClientEvent::Request(req)` | `client.on('request', req => ...)` |
+| `ClientEvent::MessageSent { message_id }` (write-confirmed) | `client.on('messageEnqueued', ...)` — **enqueue-confirmed**: a browser WebSocket offers no write completion, so the honest tier is named for what it proves |
 | `ClientEvent::Disconnected { reason }` | `client.on('close', ev => ...)` |
 | `ClientEvent::Error { error }` | `client.on('error', e => ...)` |
-| `context.respond(bytes)` | `await ctx.respond(bytes)` |
+| `Responder::respond(bytes)` / `respond_with_options` | `await req.respond(bytes, options?)` |
 
 **Things deliberately not mirrored** (TS-idiomatic instead):
 
@@ -187,8 +207,8 @@ WebTransport will land as a separate `Transport` implementation; the existing `T
 ## Roadmap
 
 - [x] **0.1.0-beta** — wire format, WebSocket transport, request/response, server-push handling
-- [ ] **0.2.0** — application-layer heartbeat hook, reconnect with backoff
-- [ ] **0.3.0** — compression codec injection (zlib via native `DecompressionStream`, zstd as peer dependency)
+- [x] **0.2.0-beta** — 2.0 semantic alignment: strict decode + `DecodeLimits`, transport-owned ids (no wrap), socket & respond generations, serialized inbound normalization, zlib via native streams, codec SPI (zstd injectable), honest enqueue tier, projected backpressure, API surface shrink
+- [ ] **0.3.0** — application-layer heartbeat hook packaged reconnect helpers
 - [ ] **0.4.0+** — WebTransport adapter
 
 ## License

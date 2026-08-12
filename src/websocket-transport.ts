@@ -1,7 +1,12 @@
-import { Packet } from './packet.js';
-import { BackpressureError, TransportError } from './errors.js';
 import {
-  type SentInfo,
+  type DecodeLimits,
+  normalizeDecodeLimits,
+  Packet,
+  ReservedFlag,
+} from './packet.js';
+import { BackpressureError, TransportError, WireFormatError } from './errors.js';
+import {
+  type EnqueuedInfo,
   type Transport,
   TransportState,
 } from './transport.js';
@@ -38,20 +43,29 @@ export interface WebSocketTransportOptions {
   webSocketFactory?: WebSocketFactory;
   /**
    * What to do with WebSocket text frames. msgtrans canonical traffic is
-   * Binary-only (see WIRE_FORMAT.md §9.1); text frames indicate misuse.
-   * Default: `'error'`.
+   * Binary-only (see WIRE_FORMAT.md §9.1); a text frame is non-protocol
+   * traffic. Default `'error'`: report and CLOSE the connection (strict,
+   * matching Rust 2.0's frame policy — a desynchronized peer is not
+   * trustworthy). `'ignore'` drops them silently.
    */
   onTextFrame?: TextFramePolicy;
   /**
-   * Outbound-buffer high-water mark in bytes. When the socket's
-   * `bufferedAmount` is already above this value, `send()` rejects with
-   * `BackpressureError` instead of silently piling more bytes onto a
-   * link that isn't draining (slow network → unbounded memory growth).
-   * The connection itself is left open. Default 16 MiB; `0` disables
-   * the check (legacy behavior). Sockets that don't report
-   * `bufferedAmount` (minimal fakes) are never rejected.
+   * Outbound-buffer high-water mark in bytes. `send()` rejects with
+   * `BackpressureError` when the socket's `bufferedAmount` PLUS this frame
+   * would exceed the mark — the projection matters: checking only the
+   * current level let a 10 MiB frame sail through at 15.9/16 MiB. The
+   * connection itself is left open. Default 16 MiB; `0` disables the check.
+   * Sockets that don't report `bufferedAmount` are never rejected.
    */
   maxBufferedBytes?: number;
+  /**
+   * Frame-decoding caps, enforced in BOTH directions with the same numbers
+   * (mirroring Rust 2.0, where one `DecodeLimits` serves every protocol):
+   * inbound frames over the caps close the connection; outbound frames over
+   * the caps are rejected here instead of letting the server kill the
+   * connection over them. Defaults match the Rust defaults.
+   */
+  limits?: Partial<DecodeLimits>;
 }
 
 /** Default outbound high-water mark: 16 MiB. */
@@ -74,10 +88,12 @@ function defaultWebSocketFactory(
 
 export class WebSocketTransport implements Transport {
   private readonly opts: WebSocketTransportOptions;
+  private readonly limits: DecodeLimits;
   private ws: WebSocketLike | null = null;
   private _state: TransportState = TransportState.Idle;
   private readonly messageHandlers: Array<(p: Packet) => void> = [];
-  private readonly messageSentHandlers: Array<(info: SentInfo) => void> = [];
+  private readonly messageEnqueuedHandlers: Array<(info: EnqueuedInfo) => void> =
+    [];
   private readonly closeHandlers: Array<(ev?: unknown) => void> = [];
   private readonly errorHandlers: Array<(e: unknown) => void> = [];
   private connectPromise: Promise<void> | null = null;
@@ -86,6 +102,7 @@ export class WebSocketTransport implements Transport {
 
   constructor(opts: WebSocketTransportOptions) {
     this.opts = opts;
+    this.limits = normalizeDecodeLimits(opts.limits);
   }
 
   get state(): TransportState {
@@ -128,16 +145,33 @@ export class WebSocketTransport implements Transport {
       this.connectReject = reject;
     });
 
+    // GENERATION ISOLATION: every handler closes over ITS socket and bails
+    // unless that socket is still the current one. Without this, a previous
+    // socket's late-arriving onclose/onerror/onmessage acted on the shared
+    // instance — closing the REPLACEMENT connection's state, nuking its
+    // pending requests, or delivering the old generation's traffic into the
+    // new one. This is the client-side twin of Rust 2.0's slot generations.
+    const isCurrent = () => this.ws === ws;
     ws.onopen = () => {
+      if (!isCurrent()) return;
       this._state = TransportState.Open;
       const resolve = this.connectResolve;
       this.connectResolve = null;
       this.connectReject = null;
       resolve?.();
     };
-    ws.onmessage = (ev) => this.handleMessage(ev);
-    ws.onerror = (ev) => this.handleError(ev);
-    ws.onclose = (ev) => this.handleClose(ev);
+    ws.onmessage = (ev) => {
+      if (!isCurrent()) return;
+      this.handleMessage(ev);
+    };
+    ws.onerror = (ev) => {
+      if (!isCurrent()) return;
+      this.handleError(ev);
+    };
+    ws.onclose = (ev) => {
+      if (!isCurrent()) return;
+      this.handleClose(ev);
+    };
 
     return this.connectPromise;
   }
@@ -148,20 +182,30 @@ export class WebSocketTransport implements Transport {
         new TransportError(`cannot send in state ${this._state}`),
       );
     }
-    // Backpressure guard: reject (without closing) when the outbound
-    // buffer is already above the high-water mark. Checked BEFORE
-    // encoding so an over-pressure caller pays no encode cost.
+    if (packet.hasFlag(ReservedFlag.Fragmented)) {
+      // Refuse to ship a mechanism nothing implements: a Fragmented frame
+      // promises reassembly the receiver cannot perform.
+      return Promise.reject(
+        new WireFormatError(
+          'ReservedFlag.Fragmented is not supported over WebSocket transport',
+        ),
+      );
+    }
+    // Backpressure guard: PROJECTED, not current-level — the question is
+    // whether the buffer would exceed the mark AFTER this frame, otherwise a
+    // large frame at 15.9/16 MiB sails through. `totalLength()` is the exact
+    // wire size, so the projection costs no encode.
     const max = this.opts.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
     const buffered = this.ws.bufferedAmount;
-    if (max > 0 && buffered !== undefined && buffered > max) {
+    if (max > 0 && buffered !== undefined && buffered + packet.totalLength() > max) {
       return Promise.reject(new BackpressureError(buffered, max));
     }
-    // Encode OUTSIDE the socket try: an encode failure (oversized
+    // Encode OUTSIDE the socket try: an encode failure (over-limit
     // ext-header/payload) is the caller's packet problem — it must
     // reject this send but never affect the connection.
     let bytes: Uint8Array;
     try {
-      bytes = packet.encode();
+      bytes = packet.encode(this.limits);
     } catch (e) {
       return Promise.reject(e);
     }
@@ -188,8 +232,8 @@ export class WebSocketTransport implements Transport {
       }
       return Promise.reject(e);
     }
-    const info: SentInfo = { messageId: packet.messageId };
-    for (const cb of this.messageSentHandlers) {
+    const info: EnqueuedInfo = { messageId: packet.messageId };
+    for (const cb of this.messageEnqueuedHandlers) {
       try {
         cb(info);
       } catch {
@@ -224,8 +268,8 @@ export class WebSocketTransport implements Transport {
     this.messageHandlers.push(cb);
   }
 
-  onMessageSent(cb: (info: SentInfo) => void): void {
-    this.messageSentHandlers.push(cb);
+  onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void {
+    this.messageEnqueuedHandlers.push(cb);
   }
 
   onClose(cb: (event?: unknown) => void): void {
@@ -252,14 +296,14 @@ export class WebSocketTransport implements Transport {
     }
     if (typeof data === 'string') {
       if (this.opts.onTextFrame === 'ignore') return;
-      this.dispatchError(
+      this.fatal(
         new TransportError(
           'received text frame; msgtrans uses binary frames only',
         ),
       );
       return;
     }
-    this.dispatchError(
+    this.fatal(
       new TransportError(`unsupported WebSocket message type: ${typeof data}`),
     );
   }
@@ -267,9 +311,13 @@ export class WebSocketTransport implements Transport {
   private decodeAndDispatch(bytes: Uint8Array): void {
     let packet: Packet;
     try {
-      packet = Packet.decode(bytes);
+      packet = Packet.decodeExact(bytes, this.limits);
     } catch (e) {
-      this.dispatchError(e);
+      // STRICT: an undecodable or over-limit frame means the peer and this
+      // client no longer agree on the protocol — the stream is not
+      // trustworthy, so the connection closes (matching Rust 2.0's default
+      // FramePolicy). The old behavior reported the error and kept reading.
+      this.fatal(e);
       return;
     }
     for (const cb of this.messageHandlers) {
@@ -279,6 +327,13 @@ export class WebSocketTransport implements Transport {
         this.dispatchError(e);
       }
     }
+  }
+
+  /** Report a protocol violation and close: strict framing has no
+   *  keep-going path. */
+  private fatal(e: unknown): void {
+    this.dispatchError(e);
+    void this.close();
   }
 
   private handleError(ev: unknown): void {

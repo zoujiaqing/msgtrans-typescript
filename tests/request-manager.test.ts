@@ -7,12 +7,15 @@ import {
   vi,
 } from 'vitest';
 import {
+  IdExhaustedError,
   Packet,
   PacketType,
-  RequestManager,
   RequestTimeoutError,
   TransportError,
 } from '../src/index.js';
+// INTERNAL import: RequestManager is deliberately absent from the public
+// surface (ids belong to the transport); tests reach in directly.
+import { RequestManager } from '../src/request-manager.js';
 import { FakeTransport } from './fake-transport.js';
 
 function newRequestPacket(): Packet {
@@ -116,9 +119,14 @@ describe('RequestManager — timeout', () => {
     const promise = m.request(newRequestPacket(), { timeoutMs: 100 });
 
     expect(m.pendingCount).toBe(1);
-    vi.advanceTimersByTime(100);
-
-    await expect(promise).rejects.toBeInstanceOf(RequestTimeoutError);
+    // Attach the expectation BEFORE advancing so the rejection is handled
+    // the moment it fires. The response timer is armed only after the
+    // enqueue resolves — the timeout measures the peer, not this side.
+    const expectation = expect(promise).rejects.toBeInstanceOf(
+      RequestTimeoutError,
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    await expectation;
     expect(m.pendingCount).toBe(0);
   });
 
@@ -138,8 +146,11 @@ describe('RequestManager — timeout', () => {
     const t = new FakeTransport();
     const m = new RequestManager(t, { defaultTimeoutMs: 50 });
     const promise = m.request(newRequestPacket());
-    vi.advanceTimersByTime(50);
-    await expect(promise).rejects.toBeInstanceOf(RequestTimeoutError);
+    const expectation = expect(promise).rejects.toBeInstanceOf(
+      RequestTimeoutError,
+    );
+    await vi.advanceTimersByTimeAsync(50);
+    await expectation;
   });
 });
 
@@ -154,13 +165,29 @@ describe('RequestManager — send (OneWay / Response passthrough)', () => {
     expect(m.pendingCount).toBe(0);
   });
 
-  it('preserves caller-set messageId (e.g., for Response)', async () => {
+  it('sendResponse() preserves the originating id — and ONLY accepts Responses', async () => {
     const t = new FakeTransport();
     const m = new RequestManager(t);
     const p = new Packet({ packetType: PacketType.Response, messageId: 42 });
-    await m.send(p);
+    await m.sendResponse(p);
     expect(p.messageId).toBe(42);
     expect(m.pendingCount).toBe(0);
+
+    // A pre-numbered Request is unrepresentable: its response could
+    // complete a different pending waiter that drew the same id.
+    const rogue = new Packet({ packetType: PacketType.Request, messageId: 7 });
+    await expect(m.sendResponse(rogue)).rejects.toThrow(
+      'only accepts Response',
+    );
+    expect(t.sent).toHaveLength(1);
+  });
+
+  it('send() overwrites any caller-set id: ids belong to the transport', async () => {
+    const t = new FakeTransport();
+    const m = new RequestManager(t);
+    const p = new Packet({ packetType: PacketType.OneWay, messageId: 999 });
+    await m.send(p);
+    expect(p.messageId).toBe(1);
   });
 
   it('shares the counter between request() and send()', async () => {
@@ -178,22 +205,32 @@ describe('RequestManager — send (OneWay / Response passthrough)', () => {
   });
 });
 
-describe('RequestManager — counter wraparound', () => {
-  it('wraps from 0xffffffff back to 1 (skipping 0)', async () => {
+describe('RequestManager — id exhaustion (never wraps)', () => {
+  it('refuses to wrap: 0xffffffff is the last id, then IdExhaustedError', async () => {
+    // Responses are matched on the bare u32; a wrapped id could complete a
+    // DIFFERENT still-pending request. Exhaustion is explicit, and a
+    // reconnect starts a fresh generation.
     const t = new FakeTransport();
     const m = new RequestManager(t, { initialMessageId: 0xfffffffe });
 
     const p1 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
     const p2 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
-    const p3 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
-
     await m.send(p1);
     await m.send(p2);
-    await m.send(p3);
-
     expect(p1.messageId).toBe(0xfffffffe);
     expect(p2.messageId).toBe(0xffffffff);
-    expect(p3.messageId).toBe(1);
+
+    const p3 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
+    await expect(m.send(p3)).rejects.toBeInstanceOf(IdExhaustedError);
+    await expect(m.request(newRequestPacket())).rejects.toBeInstanceOf(
+      IdExhaustedError,
+    );
+
+    // A fresh connection generation restarts the space.
+    m.startGeneration();
+    const p4 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
+    await m.send(p4);
+    expect(p4.messageId).toBe(0xfffffffe);
   });
 
   it('treats initialMessageId=0 as 1', async () => {
@@ -231,14 +268,21 @@ describe('RequestManager — reset', () => {
     expect(m.pendingCount).toBe(0);
   });
 
-  it('rejects pending on transport.onError', async () => {
+  it('a non-fatal transport error does NOT reject pending (only close does)', async () => {
+    // Old behavior reset ALL pending on any transport error, so a single
+    // recoverable error nuked every in-flight request while the connection
+    // stayed healthy. Protocol violations now close the connection at the
+    // transport layer; pending state rides the connection, nothing else.
     const t = new FakeTransport();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket());
+    await Promise.resolve();
 
-    t.fireError(new Error('socket failed'));
+    t.fireError(new Error('socket hiccup'));
+    expect(m.pendingCount).toBe(1); // untouched
 
-    await expect(promise).rejects.toThrow('socket failed');
+    t.fireClose();
+    await expect(promise).rejects.toThrow('transport closed');
     expect(m.pendingCount).toBe(0);
   });
 

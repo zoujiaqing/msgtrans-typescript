@@ -1,4 +1,8 @@
-import { Packet, type SentInfo, type Transport } from '../src/index.js';
+import {
+  Packet,
+  type EnqueuedInfo,
+  type Transport,
+} from '../src/index.js';
 
 export class FakeTransport implements Transport {
   readonly sent: Packet[] = [];
@@ -7,10 +11,13 @@ export class FakeTransport implements Transport {
 
   sendShouldFail: Error | null = null;
   connectShouldFail: Error | null = null;
+  /** When set, send() resolves only after this many ms (async enqueue). */
+  sendDelayMs = 0;
 
   private _isConnected = false;
   private readonly messageHandlers: Array<(p: Packet) => void> = [];
-  private readonly messageSentHandlers: Array<(info: SentInfo) => void> = [];
+  private readonly messageEnqueuedHandlers: Array<(info: EnqueuedInfo) => void> =
+    [];
   private readonly closeHandlers: Array<(ev?: unknown) => void> = [];
   private readonly errorHandlers: Array<(e: unknown) => void> = [];
 
@@ -21,10 +28,13 @@ export class FakeTransport implements Transport {
   }
 
   async send(packet: Packet): Promise<void> {
+    if (this.sendDelayMs > 0) {
+      await new Promise((r) => setTimeout(r, this.sendDelayMs));
+    }
     if (this.sendShouldFail) throw this.sendShouldFail;
     this.sent.push(packet);
-    const info: SentInfo = { messageId: packet.messageId };
-    for (const cb of this.messageSentHandlers) cb(info);
+    const info: EnqueuedInfo = { messageId: packet.messageId };
+    for (const cb of this.messageEnqueuedHandlers) cb(info);
   }
 
   async close(): Promise<void> {
@@ -39,8 +49,8 @@ export class FakeTransport implements Transport {
   onMessage(cb: (packet: Packet) => void): void {
     this.messageHandlers.push(cb);
   }
-  onMessageSent(cb: (info: SentInfo) => void): void {
-    this.messageSentHandlers.push(cb);
+  onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void {
+    this.messageEnqueuedHandlers.push(cb);
   }
   onClose(cb: (event?: unknown) => void): void {
     this.closeHandlers.push(cb);
@@ -58,5 +68,26 @@ export class FakeTransport implements Transport {
   }
   fireError(e: unknown): void {
     for (const cb of this.errorHandlers) cb(e);
+  }
+}
+
+/** Drain the microtask + macrotask queue once: inbound normalization and the
+ *  outbound chain are async, so delivery is never synchronous any more. */
+export function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Poll until `cond` holds (native decompression takes several async hops,
+ *  so a single flush is not deterministic). Throws after `timeoutMs`. */
+export async function until(
+  cond: () => boolean,
+  timeoutMs = 2000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) {
+      throw new Error('condition not reached within timeout');
+    }
+    await flush();
   }
 }

@@ -98,7 +98,7 @@ describe('fixture batch 1 — round-trip', () => {
       ) as FixtureJson;
 
       // Direction 1: decode .bin, fields match .json
-      const parsed = Packet.decode(binBytes);
+      const parsed = Packet.decodeExact(binBytes);
       expect(parsed.version).toBe(spec.version);
       expect(parsed.compression).toBe(spec.compression);
       expect(parsed.packetType).toBe(spec.packet_type);

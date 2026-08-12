@@ -1,27 +1,22 @@
 import { Packet, PacketType } from './packet.js';
-import { TransportError } from './errors.js';
+import {
+  IdExhaustedError,
+  RequestTimeoutError,
+  TransportError,
+} from './errors.js';
 import type { Transport } from './transport.js';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const U32_MAX = 0xffffffff;
-
-export class RequestTimeoutError extends Error {
-  readonly messageId: number;
-  readonly timeoutMs: number;
-  constructor(messageId: number, timeoutMs: number) {
-    super(`request ${messageId} timed out after ${timeoutMs}ms`);
-    this.name = 'RequestTimeoutError';
-    this.messageId = messageId;
-    this.timeoutMs = timeoutMs;
-  }
-}
 
 export interface RequestManagerOptions {
   /** Default request timeout in milliseconds. Default: 10_000. */
   defaultTimeoutMs?: number;
   /**
    * Starting value of the messageId counter (1..0xffffffff, 0 is reserved).
-   * Default: 1. Useful for testing wraparound or for advanced reconnect flows.
+   * INTERNAL — exists so tests can reach the exhaustion boundary without
+   * 2^32 allocations. Not exposed through `TransportClientOptions`: ids
+   * belong to the transport.
    */
   initialMessageId?: number;
 }
@@ -37,23 +32,33 @@ interface PendingEntry {
   timer: ReturnType<typeof setTimeout> | null;
 }
 
+/**
+ * INTERNAL request lifecycle owner — the TS mapping of Rust 2.0's
+ * `RequestRegistry`. Not part of the public API: message ids are allocated
+ * here and nowhere else, so no caller-numbered `Request` can complete a
+ * different waiter that happened to draw the same id.
+ */
 export class RequestManager {
   private readonly transport: Transport;
   private readonly defaultTimeoutMs: number;
+  private readonly initialMessageId: number;
   private readonly pending = new Map<number, PendingEntry>();
   private counter: number;
 
   constructor(transport: Transport, options: RequestManagerOptions = {}) {
     this.transport = transport;
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.counter = normalizeCounterStart(options.initialMessageId ?? 1);
+    this.initialMessageId = normalizeCounterStart(
+      options.initialMessageId ?? 1,
+    );
+    this.counter = this.initialMessageId;
 
-    transport.onClose(() =>
-      this.reset(new TransportError('transport closed')),
-    );
-    transport.onError((e) =>
-      this.reset(e instanceof Error ? e : new TransportError(String(e))),
-    );
+    // Pending state rides the CONNECTION, so it resets exactly when the
+    // connection ends — and only then. (It used to also reset on every
+    // transport error, so a single non-fatal error nuked all in-flight
+    // requests while the connection stayed healthy. Protocol violations now
+    // close the connection at the transport layer, which lands here.)
+    transport.onClose(() => this.reset(new TransportError('transport closed')));
   }
 
   get pendingCount(): number {
@@ -61,18 +66,24 @@ export class RequestManager {
   }
 
   /**
-   * Send a packet through the transport without registering it for response.
-   *
-   * - If `packet.messageId === 0`, allocates the next id from the shared
-   *   counter (so OneWay and Request share the same id space, per
-   *   WIRE_FORMAT.md §5.5).
-   * - Otherwise leaves the id intact (used when sending a `Response` that
-   *   must reuse the originating Request's id).
-   * - Mutates `packet.messageId` when allocating.
+   * Send a one-way packet. Always allocates the id — callers cannot number
+   * their own packets through this path.
    */
   async send(packet: Packet): Promise<void> {
-    if (packet.messageId === 0) {
-      packet.messageId = this.nextMessageId();
+    packet.messageId = this.nextMessageId();
+    await this.transport.send(packet);
+  }
+
+  /**
+   * INTERNAL respond path: ship a Response that must reuse its originating
+   * Request's id. The only place a pre-numbered packet is accepted, and it
+   * only accepts Responses — a pre-numbered Request is unrepresentable.
+   */
+  async sendResponse(packet: Packet): Promise<void> {
+    if (packet.packetType !== PacketType.Response) {
+      throw new TransportError(
+        'sendResponse only accepts Response packets',
+      );
     }
     await this.transport.send(packet);
   }
@@ -80,37 +91,50 @@ export class RequestManager {
   /**
    * Send a Request packet and resolve when the matching Response arrives.
    *
-   * Always sets `packetType = Request` and allocates a fresh messageId,
-   * regardless of the packet's prior state. Mutates the input packet.
-   *
-   * If the transport's `send` rejects, the pending entry is cleaned up
-   * and the returned promise rejects with the same error.
+   * Lifecycle, in order:
+   * 1. Register the pending entry FIRST — a transport that loops back
+   *    synchronously must find it.
+   * 2. Enqueue. A rejection removes the entry and rejects the caller.
+   * 3. Arm the response timer only AFTER the enqueue succeeds: the timeout
+   *    measures the peer's response time, not this side's enqueue time. The
+   *    old order started the clock before `send()` was even called, so a
+   *    slow async transport could "time out" a request that had not been
+   *    sent — and then send it anyway, minting an orphan response.
+   * 4. If the response arrived before the enqueue promise resolved, there is
+   *    no entry left and no timer is armed.
    */
   request(packet: Packet, options: RequestOptions = {}): Promise<Packet> {
     const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
-    const messageId = this.nextMessageId();
+    let messageId: number;
+    try {
+      messageId = this.nextMessageId();
+    } catch (e) {
+      return Promise.reject(e);
+    }
     packet.packetType = PacketType.Request;
     packet.messageId = messageId;
 
     return new Promise<Packet>((resolve, reject) => {
-      const timer =
-        timeoutMs > 0 && Number.isFinite(timeoutMs)
-          ? setTimeout(() => {
+      const entry: PendingEntry = { resolve, reject, timer: null };
+      this.pending.set(messageId, entry);
+
+      this.transport.send(packet).then(
+        () => {
+          if (this.pending.get(messageId) !== entry) return; // already resolved
+          if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+            entry.timer = setTimeout(() => {
               if (this.pending.delete(messageId)) {
                 reject(new RequestTimeoutError(messageId, timeoutMs));
               }
-            }, timeoutMs)
-          : null;
-
-      this.pending.set(messageId, { resolve, reject, timer });
-
-      this.transport.send(packet).catch((sendError) => {
-        const entry = this.pending.get(messageId);
-        if (!entry) return;
-        if (entry.timer) clearTimeout(entry.timer);
-        this.pending.delete(messageId);
-        reject(sendError);
-      });
+            }, timeoutMs);
+          }
+        },
+        (sendError) => {
+          if (this.pending.get(messageId) !== entry) return;
+          this.pending.delete(messageId);
+          reject(sendError);
+        },
+      );
     });
   }
 
@@ -132,7 +156,7 @@ export class RequestManager {
 
   /**
    * Reject all pending requests with the given reason. Auto-invoked on
-   * transport close/error; callers may also invoke before reconnect.
+   * transport close; callers may also invoke before reconnect.
    */
   reset(reason: unknown = new TransportError('request manager reset')): void {
     if (this.pending.size === 0) return;
@@ -144,15 +168,31 @@ export class RequestManager {
     }
   }
 
+  /**
+   * Start a fresh connection generation: the id counter restarts. Mirrors
+   * Rust 2.0, where a reconnect gets a fresh session with a fresh counter —
+   * safe because the close that preceded it rejected every pending entry,
+   * and stale responders are refused by the client's generation guard.
+   */
+  startGeneration(): void {
+    this.counter = this.initialMessageId;
+  }
+
   private nextMessageId(): number {
+    // NEVER wraps within a generation: responses are matched on the bare
+    // u32, so a wrapped id could complete a different, still-pending
+    // request. Exhaustion is an explicit error; a reconnect starts a fresh
+    // generation via `startGeneration()`.
+    if (this.counter > U32_MAX) {
+      throw new IdExhaustedError();
+    }
     const id = this.counter;
-    // Wrap u32: ...fffe → ...ffff → 1 (skip 0 so id=0 stays "unset").
-    this.counter = this.counter >= U32_MAX ? 1 : this.counter + 1;
+    this.counter += 1;
     return id;
   }
 }
 
 function normalizeCounterStart(n: number): number {
-  const u32 = (n >>> 0);
+  const u32 = n >>> 0;
   return u32 === 0 ? 1 : u32;
 }

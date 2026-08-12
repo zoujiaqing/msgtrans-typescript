@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ClientMessage,
+  ClientRequest,
   CompressionType,
   Packet,
   PacketType,
   TransportClient,
-  TransportContext,
   TransportError,
   UnsupportedCompressionError,
   type WebSocketLike,
 } from '../src/index.js';
-import { FakeTransport } from './fake-transport.js';
+import { FakeTransport, flush } from './fake-transport.js';
 
 function newClient(transport: FakeTransport): TransportClient {
   return new TransportClient({ transport });
@@ -76,6 +77,7 @@ describe('TransportClient — send / request convenience methods', () => {
     const promise = c.request(new TextEncoder().encode('ping'), {
       bizType: 100,
     });
+    await flush(); // enqueue rides the outbound chain
 
     expect(t.sent).toHaveLength(1);
     const sent = t.sent[0]!;
@@ -96,68 +98,43 @@ describe('TransportClient — send / request convenience methods', () => {
     expect(new TextDecoder().decode(respBytes)).toBe('pong');
   });
 
-  it('sendPacket() / requestPacket() expose the raw Packet', async () => {
+  it('ids belong to the transport: no public path accepts a caller-numbered packet', () => {
+    // `sendPacket()` / `requestPacket()` / `initialMessageId` are gone: a
+    // caller-numbered Request could complete a DIFFERENT pending waiter that
+    // happened to draw the same id (the ABA the Rust 2.0 registry closed).
     const t = new FakeTransport();
-    const c = newClient(t);
-
-    const oneway = new Packet({
-      packetType: PacketType.OneWay,
-      messageId: 0,
-      bizType: 9,
-      payload: new TextEncoder().encode('data'),
-    });
-    await c.sendPacket(oneway);
-    expect(oneway.messageId).toBe(1);
-
-    const reqPacket = new Packet({
-      packetType: PacketType.OneWay,
-      messageId: 0,
-      bizType: 11,
-      payload: new TextEncoder().encode('q'),
-    });
-    const promise = c.requestPacket(reqPacket);
-    const reqId = reqPacket.messageId;
-
-    t.fireMessage(
-      new Packet({
-        packetType: PacketType.Response,
-        messageId: reqId,
-        bizType: 11,
-        payload: new TextEncoder().encode('a'),
-      }),
-    );
-    const fullResponse = await promise;
-    expect(fullResponse).toBeInstanceOf(Packet);
-    expect(fullResponse.bizType).toBe(11);
-    expect(new TextDecoder().decode(fullResponse.payload)).toBe('a');
+    const c = newClient(t) as unknown as Record<string, unknown>;
+    expect(c['sendPacket']).toBeUndefined();
+    expect(c['requestPacket']).toBeUndefined();
   });
 });
 
 describe('TransportClient — message routing', () => {
-  it('OneWay packets surface via on("message") with TransportContext', () => {
+  it('OneWay packets surface via on("message") as ClientMessage', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    const received: TransportContext[] = [];
-    c.on('message', (ctx) => received.push(ctx));
+    const received: ClientMessage[] = [];
+    c.on('message', (msg) => received.push(msg));
 
     t.fireMessage(makeOneWayInbound('hi', 3));
+    await flush();
 
     expect(received).toHaveLength(1);
-    const ctx = received[0]!;
-    expect(ctx.packetType).toBe(PacketType.OneWay);
-    expect(ctx.bizType).toBe(3);
-    expect(ctx.messageId).toBe(555);
-    expect(new TextDecoder().decode(ctx.data)).toBe('hi');
-    expect(ctx.isRequest).toBe(false);
+    const msg = received[0]!;
+    expect(msg.bizType).toBe(3);
+    expect(msg.messageId).toBe(555);
+    expect(new TextDecoder().decode(msg.data)).toBe('hi');
+    expect(msg).toBeInstanceOf(ClientMessage);
   });
 
   it('Response packets matching pending request do NOT trigger message event', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    const received: TransportContext[] = [];
-    c.on('message', (ctx) => received.push(ctx));
+    const received: ClientMessage[] = [];
+    c.on('message', (msg) => received.push(msg));
 
     const promise = c.request(new TextEncoder().encode('ping'));
+    await flush();
     const reqId = t.sent[0]!.messageId;
 
     t.fireMessage(
@@ -172,16 +149,12 @@ describe('TransportClient — message routing', () => {
     expect(received).toHaveLength(0);
   });
 
-  it('Response with unknown messageId is DROPPED (reported via error channel, never as message)', () => {
-    // Behavior change (robustness round): an orphan Response used to be
-    // surfaced via on('message'), where apps could mistake it for
-    // server-pushed data. It is now dropped + reported through
-    // on('error'). See tests/robustness.test.ts for the full contract.
+  it('Response with unknown messageId is DROPPED (reported via error channel, never as message)', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    const received: TransportContext[] = [];
+    const received: ClientMessage[] = [];
     const errors: unknown[] = [];
-    c.on('message', (ctx) => received.push(ctx));
+    c.on('message', (msg) => received.push(msg));
     c.on('error', (e) => errors.push(e));
 
     t.fireMessage(
@@ -191,26 +164,29 @@ describe('TransportClient — message routing', () => {
         payload: new Uint8Array(),
       }),
     );
+    await flush();
 
     expect(received).toHaveLength(0);
     expect(errors).toHaveLength(1);
   });
 
-  it('Request packets surface via on("message") and ctx.respond() sends a Response', async () => {
+  it('Request packets surface via on("request") as ClientRequest, NOT via on("message")', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    const received: TransportContext[] = [];
-    c.on('message', (ctx) => received.push(ctx));
+    const messages: ClientMessage[] = [];
+    const requests: ClientRequest[] = [];
+    c.on('message', (m) => messages.push(m));
+    c.on('request', (r) => requests.push(r));
 
-    const inboundReq = makeRequestInbound(12345, 50);
-    t.fireMessage(inboundReq);
+    t.fireMessage(makeRequestInbound(12345, 50));
+    await flush();
 
-    expect(received).toHaveLength(1);
-    const ctx = received[0]!;
-    expect(ctx.isRequest).toBe(true);
-    expect(ctx.messageId).toBe(12345);
+    expect(messages).toHaveLength(0);
+    expect(requests).toHaveLength(1);
+    const req = requests[0]!;
+    expect(req.messageId).toBe(12345);
 
-    await ctx.respond(new TextEncoder().encode('here you go'));
+    await req.respond(new TextEncoder().encode('here you go'));
 
     expect(t.sent).toHaveLength(1);
     const resp = t.sent[0]!;
@@ -218,48 +194,73 @@ describe('TransportClient — message routing', () => {
     expect(resp.messageId).toBe(12345); // reused
     expect(resp.bizType).toBe(50); // inherited
     expect(new TextDecoder().decode(resp.payload)).toBe('here you go');
-    expect(ctx.hasResponded).toBe(true);
+    expect(req.hasResponded).toBe(true);
   });
 
   it('respond() can override bizType', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    let captured: TransportContext | null = null;
-    c.on('message', (ctx) => {
-      captured = ctx;
+    let captured: ClientRequest | null = null;
+    c.on('request', (r) => {
+      captured = r;
     });
     t.fireMessage(makeRequestInbound(1, 50));
+    await flush();
     await captured!.respond(new Uint8Array(), { bizType: 99 });
     expect(t.sent[0]!.bizType).toBe(99);
   });
 
-  it('respond() rejects on non-Request packets', async () => {
+  it('a OneWay has no respond() at all (typed split, not a runtime check)', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    let captured: TransportContext | null = null;
-    c.on('message', (ctx) => {
-      captured = ctx;
+    let captured: ClientMessage | null = null;
+    c.on('message', (m) => {
+      captured = m;
     });
     t.fireMessage(makeOneWayInbound('hi'));
+    await flush();
 
-    await expect(
-      captured!.respond(new TextEncoder().encode('nope')),
-    ).rejects.toBeInstanceOf(TransportError);
+    expect(
+      (captured as unknown as Record<string, unknown>)['respond'],
+    ).toBeUndefined();
   });
 
   it('respond() rejects when called twice', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    let captured: TransportContext | null = null;
-    c.on('message', (ctx) => {
-      captured = ctx;
+    let captured: ClientRequest | null = null;
+    c.on('request', (r) => {
+      captured = r;
     });
     t.fireMessage(makeRequestInbound(7));
+    await flush();
 
     await captured!.respond(new Uint8Array());
-    await expect(
-      captured!.respond(new Uint8Array()),
-    ).rejects.toBeInstanceOf(TransportError);
+    await expect(captured!.respond(new Uint8Array())).rejects.toBeInstanceOf(
+      TransportError,
+    );
+  });
+
+  it('respond() refuses to write onto a LATER connection generation', async () => {
+    // A stale response written after a reconnect could complete a DIFFERENT
+    // server-side request that drew the same id — the cross-generation leak
+    // Rust 2.0 closed with generation-bound claims.
+    const t = new FakeTransport();
+    const c = newClient(t);
+    let captured: ClientRequest | null = null;
+    c.on('request', (r) => {
+      captured = r;
+    });
+    t.fireMessage(makeRequestInbound(42));
+    await flush();
+
+    t.fireClose(); // connection turns over
+    await c.connect(); // new generation
+
+    await expect(captured!.respond(new Uint8Array())).rejects.toThrow(
+      /generation/,
+    );
+    expect(t.sent).toHaveLength(0); // nothing reached the wire
   });
 });
 
@@ -283,22 +284,24 @@ describe('TransportClient — close / error events', () => {
     expect(errors).toEqual([boom]);
   });
 
-  it('on() returns an unsubscribe function', () => {
+  it('on() returns an unsubscribe function', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    const received: TransportContext[] = [];
-    const off = c.on('message', (ctx) => received.push(ctx));
+    const received: ClientMessage[] = [];
+    const off = c.on('message', (m) => received.push(m));
 
     t.fireMessage(makeOneWayInbound('first'));
+    await flush();
     off();
     t.fireMessage(makeOneWayInbound('second'));
+    await flush();
 
     expect(received).toHaveLength(1);
     expect(new TextDecoder().decode(received[0]!.data)).toBe('first');
   });
 });
 
-describe('TransportClient — Rust-compat surface (B-mini)', () => {
+describe('TransportClient — Rust-compat surface', () => {
   it('disconnect() is an alias for close()', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
@@ -319,30 +322,31 @@ describe('TransportClient — Rust-compat surface (B-mini)', () => {
     expect(c.isConnected()).toBe(false);
   });
 
-  it('messageSent event fires after each successful send (OneWay)', async () => {
+  it('messageEnqueued fires after each accepted send (honest tier: enqueue, not write)', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
     await c.connect();
 
-    const sent: number[] = [];
-    c.on('messageSent', (info) => sent.push(info.messageId));
+    const enqueued: number[] = [];
+    c.on('messageEnqueued', (info) => enqueued.push(info.messageId));
 
     await c.send(new TextEncoder().encode('a'));
     await c.send(new TextEncoder().encode('b'));
 
-    expect(sent).toEqual([1, 2]);
+    expect(enqueued).toEqual([1, 2]);
   });
 
-  it('messageSent event fires for the Request portion of request()', async () => {
+  it('messageEnqueued fires for the Request portion of request()', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
     await c.connect();
 
-    const sent: number[] = [];
-    c.on('messageSent', (info) => sent.push(info.messageId));
+    const enqueued: number[] = [];
+    c.on('messageEnqueued', (info) => enqueued.push(info.messageId));
 
     const promise = c.request(new TextEncoder().encode('q'));
-    expect(sent).toEqual([1]); // Request was sent (synchronously through FakeTransport)
+    await flush();
+    expect(enqueued).toEqual([1]);
 
     t.fireMessage(
       new Packet({
@@ -354,19 +358,19 @@ describe('TransportClient — Rust-compat surface (B-mini)', () => {
     await promise;
   });
 
-  it('on("messageSent") returns an unsubscribe function', async () => {
+  it('on("messageEnqueued") returns an unsubscribe function', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
     await c.connect();
 
-    const sent: number[] = [];
-    const off = c.on('messageSent', (info) => sent.push(info.messageId));
+    const enqueued: number[] = [];
+    const off = c.on('messageEnqueued', (info) => enqueued.push(info.messageId));
 
     await c.send(new TextEncoder().encode('first'));
     off();
     await c.send(new TextEncoder().encode('second'));
 
-    expect(sent).toEqual([1]);
+    expect(enqueued).toEqual([1]);
   });
 
   it('SendOptions.extHeader is propagated onto the wire packet', async () => {
@@ -386,13 +390,23 @@ describe('TransportClient — Rust-compat surface (B-mini)', () => {
     expect(Array.from(p.extHeader)).toEqual(Array.from(ext));
   });
 
-  it('SendOptions.reserved is propagated onto the wire packet', async () => {
+  it('respond() propagates extHeader', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
-    await c.connect();
+    let captured: ClientRequest | null = null;
+    c.on('request', (r) => {
+      captured = r;
+    });
+    t.fireMessage(makeRequestInbound(7, 5));
+    await flush();
 
-    await c.send(new TextEncoder().encode('p'), { reserved: 0x0006 });
-    expect(t.sent[0]!.reserved).toBe(0x0006);
+    const ext = new TextEncoder().encode('route:reply');
+    await captured!.respond(new TextEncoder().encode('!'), { extHeader: ext });
+
+    expect(t.sent).toHaveLength(1);
+    const r = t.sent[0]!;
+    expect(r.messageId).toBe(7); // reused
+    expect(Array.from(r.extHeader)).toEqual(Array.from(ext));
   });
 
   it('SendOptions.compression=None is allowed and reaches the packet', async () => {
@@ -406,83 +420,18 @@ describe('TransportClient — Rust-compat surface (B-mini)', () => {
     expect(t.sent[0]!.compression).toBe(CompressionType.None);
   });
 
-  it('send() rejects with UnsupportedCompressionError when compression != None', async () => {
+  it('send() rejects with UnsupportedCompressionError for an unregistered codec (Zstd)', async () => {
     const t = new FakeTransport();
     const c = newClient(t);
     await c.connect();
 
     await expect(
       c.send(new TextEncoder().encode('p'), {
-        compression: CompressionType.Zlib,
+        compression: CompressionType.Zstd,
       }),
     ).rejects.toBeInstanceOf(UnsupportedCompressionError);
 
     expect(t.sent).toHaveLength(0); // nothing left the client
-  });
-
-  it('request() rejects with UnsupportedCompressionError when compression != None', async () => {
-    const t = new FakeTransport();
-    const c = newClient(t);
-    await c.connect();
-
-    await expect(
-      c.request(new TextEncoder().encode('p'), {
-        compression: CompressionType.Zstd,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedCompressionError);
-  });
-
-  it('ctx.respond() rejects with UnsupportedCompressionError when compression != None', async () => {
-    const t = new FakeTransport();
-    const c = newClient(t);
-    let captured: TransportContext | null = null;
-    c.on('message', (ctx) => {
-      captured = ctx;
-    });
-    t.fireMessage(
-      new Packet({
-        packetType: PacketType.Request,
-        messageId: 99,
-        bizType: 5,
-        payload: new TextEncoder().encode('?'),
-      }),
-    );
-
-    await expect(
-      captured!.respond(new TextEncoder().encode('!'), {
-        compression: CompressionType.Zlib,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedCompressionError);
-    expect(captured!.hasResponded).toBe(false);
-  });
-
-  it('ctx.respond() propagates extHeader and reserved', async () => {
-    const t = new FakeTransport();
-    const c = newClient(t);
-    let captured: TransportContext | null = null;
-    c.on('message', (ctx) => {
-      captured = ctx;
-    });
-    t.fireMessage(
-      new Packet({
-        packetType: PacketType.Request,
-        messageId: 7,
-        bizType: 5,
-        payload: new TextEncoder().encode('?'),
-      }),
-    );
-
-    const ext = new TextEncoder().encode('route:reply');
-    await captured!.respond(new TextEncoder().encode('!'), {
-      extHeader: ext,
-      reserved: 0x0002,
-    });
-
-    expect(t.sent).toHaveLength(1);
-    const r = t.sent[0]!;
-    expect(r.messageId).toBe(7); // reused
-    expect(Array.from(r.extHeader)).toEqual(Array.from(ext));
-    expect(r.reserved).toBe(0x0002);
   });
 });
 
@@ -525,7 +474,7 @@ describe('TransportClient — default WebSocket transport', () => {
     expect(ws.sent).toHaveLength(1);
 
     // Roundtrip: parse what was sent and confirm semantics.
-    const parsed = Packet.decode(ws.sent[0]!);
+    const parsed = Packet.decodeExact(ws.sent[0]!);
     expect(parsed.packetType).toBe(PacketType.OneWay);
     expect(parsed.bizType).toBe(1);
     expect(new TextDecoder().decode(parsed.payload)).toBe('payload');

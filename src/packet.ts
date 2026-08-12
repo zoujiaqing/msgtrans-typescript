@@ -1,11 +1,15 @@
 import {
+  DEFAULT_MAX_EXT_HEADER_LEN,
+  DEFAULT_MAX_PAYLOAD_LEN,
   FIXED_HEADER_LEN,
-  MAX_EXT_HEADER_LEN,
-  MAX_PAYLOAD_LEN,
   PROTOCOL_VERSION,
+  WIRE_MAX_EXT_HEADER_LEN,
+  WIRE_MAX_PAYLOAD_LEN,
 } from './constants.js';
 import {
+  DecodeLimitError,
   IncompletePacketError,
+  UnknownWireValueError,
   UnsupportedVersionError,
   WireFormatError,
 } from './errors.js';
@@ -25,11 +29,49 @@ export const CompressionType = {
 export type CompressionType =
   (typeof CompressionType)[keyof typeof CompressionType];
 
+/**
+ * Wire metadata bits in the `reserved` field.
+ *
+ * `HighPriority` and `HasRouteTag` are annotations a peer may read.
+ * `Fragmented` describes a mechanism this client does not implement —
+ * `WebSocketTransport.send()` refuses to send it rather than shipping a
+ * promise the receiver cannot rely on.
+ */
 export const ReservedFlag = {
   Fragmented: 0x0001,
   HighPriority: 0x0002,
   HasRouteTag: 0x0004,
 } as const;
+
+/**
+ * Frame-decoding caps, mirroring Rust 2.0's `DecodeLimits`.
+ *
+ * The frame cap is DERIVED (header + ext + payload), never set independently:
+ * a max frame that disagreed with its parts would reject frames whose parts
+ * were each individually legal. The default payload cap matches the Rust
+ * decompression-bomb cap (16 MiB), so both peers agree on what fits.
+ */
+export interface DecodeLimits {
+  readonly maxPayloadLen: number;
+  readonly maxExtHeaderLen: number;
+}
+
+export const DEFAULT_DECODE_LIMITS: DecodeLimits = {
+  maxPayloadLen: DEFAULT_MAX_PAYLOAD_LEN,
+  maxExtHeaderLen: DEFAULT_MAX_EXT_HEADER_LEN,
+};
+
+/** Clamp caller-supplied limits into what the wire format can express. */
+export function normalizeDecodeLimits(
+  limits?: Partial<DecodeLimits>,
+): DecodeLimits {
+  const payload = limits?.maxPayloadLen ?? DEFAULT_MAX_PAYLOAD_LEN;
+  const ext = limits?.maxExtHeaderLen ?? DEFAULT_MAX_EXT_HEADER_LEN;
+  return {
+    maxPayloadLen: Math.min(Math.max(payload, 0), WIRE_MAX_PAYLOAD_LEN),
+    maxExtHeaderLen: Math.min(Math.max(ext, 0), WIRE_MAX_EXT_HEADER_LEN),
+  };
+}
 
 const EMPTY: Uint8Array = new Uint8Array(0);
 
@@ -93,15 +135,34 @@ export class Packet {
     return FIXED_HEADER_LEN + this.extHeader.length + this.payload.length;
   }
 
-  encode(): Uint8Array {
-    if (this.extHeader.length > MAX_EXT_HEADER_LEN) {
-      throw new WireFormatError(
-        `ext_header too large: ${this.extHeader.length} > ${MAX_EXT_HEADER_LEN}`,
+  /**
+   * Encode to wire bytes.
+   *
+   * Enforces the SAME caps the peer decodes with: without `limits` the
+   * defaults apply, so this client cannot produce a frame a default-configured
+   * Rust 2.0 server is guaranteed to close the connection over. (The old
+   * behavior checked only the raw u16/u32 wire ceilings — up to 4 GiB.)
+   */
+  encode(limits: DecodeLimits = DEFAULT_DECODE_LIMITS): Uint8Array {
+    if (this.extHeader.length > limits.maxExtHeaderLen) {
+      throw new DecodeLimitError(
+        `ext_header too large: ${this.extHeader.length} > ${limits.maxExtHeaderLen}`,
       );
     }
-    if (this.payload.length > MAX_PAYLOAD_LEN) {
+    if (this.payload.length > limits.maxPayloadLen) {
+      throw new DecodeLimitError(
+        `payload too large: ${this.payload.length} > ${limits.maxPayloadLen}`,
+      );
+    }
+    // Wire ceilings are a hard floor under any configured limits.
+    if (this.extHeader.length > WIRE_MAX_EXT_HEADER_LEN) {
       throw new WireFormatError(
-        `payload too large: ${this.payload.length} > ${MAX_PAYLOAD_LEN}`,
+        `ext_header exceeds wire format: ${this.extHeader.length}`,
+      );
+    }
+    if (this.payload.length > WIRE_MAX_PAYLOAD_LEN) {
+      throw new WireFormatError(
+        `payload exceeds wire format: ${this.payload.length}`,
       );
     }
 
@@ -123,7 +184,20 @@ export class Packet {
     return buf;
   }
 
-  static decode(bytes: Uint8Array): Packet {
+  /**
+   * STRICT decode of exactly one packet.
+   *
+   * One WebSocket binary message carries exactly one packet, so this is the
+   * only decode shape: trailing bytes mean the stream is desynchronized and
+   * are a protocol error, not tolerated silence. Unknown packet-type or
+   * compression bytes are protocol errors (`UnknownWireValueError`) instead
+   * of being cast into bogus enum members. Declared lengths over the
+   * configured `DecodeLimits` are rejected before any allocation.
+   */
+  static decodeExact(
+    bytes: Uint8Array,
+    limits: DecodeLimits = DEFAULT_DECODE_LIMITS,
+  ): Packet {
     if (bytes.length < FIXED_HEADER_LEN) {
       throw new IncompletePacketError(
         `header too short: ${bytes.length} < ${FIXED_HEADER_LEN}`,
@@ -135,18 +209,42 @@ export class Packet {
     if (version !== PROTOCOL_VERSION) {
       throw new UnsupportedVersionError(version);
     }
-    const compression = bytes[1]! as CompressionType;
-    const packetType = bytes[2]! as PacketType;
+    const compressionByte = bytes[1]!;
+    if (compressionByte > 2) {
+      throw new UnknownWireValueError('compression', compressionByte);
+    }
+    const packetTypeByte = bytes[2]!;
+    if (packetTypeByte > 2) {
+      throw new UnknownWireValueError('packet_type', packetTypeByte);
+    }
+    const compression = compressionByte as CompressionType;
+    const packetType = packetTypeByte as PacketType;
     const bizType = bytes[3]!;
     const messageId = view.getUint32(4, false);
     const extHeaderLen = view.getUint16(8, false);
     const payloadLen = view.getUint32(10, false);
     const reserved = view.getUint16(14, false);
 
+    if (extHeaderLen > limits.maxExtHeaderLen) {
+      throw new DecodeLimitError(
+        `declared ext_header ${extHeaderLen} > limit ${limits.maxExtHeaderLen}`,
+      );
+    }
+    if (payloadLen > limits.maxPayloadLen) {
+      throw new DecodeLimitError(
+        `declared payload ${payloadLen} > limit ${limits.maxPayloadLen}`,
+      );
+    }
+
     const expected = FIXED_HEADER_LEN + extHeaderLen + payloadLen;
     if (bytes.length < expected) {
       throw new IncompletePacketError(
         `packet incomplete: have ${bytes.length}, need ${expected}`,
+      );
+    }
+    if (bytes.length > expected) {
+      throw new WireFormatError(
+        `trailing bytes after packet: have ${bytes.length}, frame is ${expected}`,
       );
     }
 

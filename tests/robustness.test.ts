@@ -14,7 +14,7 @@ import {
   WebSocketTransport,
   type WebSocketLike,
 } from '../src/index.js';
-import { FakeTransport } from './fake-transport.js';
+import { FakeTransport, flush } from './fake-transport.js';
 
 class MockWebSocket implements WebSocketLike {
   binaryType = 'blob';
@@ -198,6 +198,7 @@ describe('orphan Response handling', () => {
         payload: new Uint8Array([1]),
       }),
     );
+    await flush(); // inbound rides the serial normalizer chain
 
     expect(messages).toHaveLength(0); // NOT surfaced as a push
     expect(errors).toHaveLength(1);
@@ -221,6 +222,7 @@ describe('orphan Response handling', () => {
         payload: new Uint8Array([1]),
       }),
     );
+    await flush();
     expect(messages).toHaveLength(1);
   });
 });

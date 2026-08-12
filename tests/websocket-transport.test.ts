@@ -204,7 +204,7 @@ describe('WebSocketTransport — send', () => {
     await connect(t, m);
 
     const fixture = readFixture('02_oneway_text.bin');
-    const packet = Packet.decode(fixture);
+    const packet = Packet.decodeExact(fixture);
     await t.send(packet);
 
     expect(Array.from(m.sent[0]!)).toEqual(Array.from(fixture));

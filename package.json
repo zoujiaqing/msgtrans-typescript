@@ -1,7 +1,7 @@
 {
   "name": "@msgtrans/client",
-  "version": "0.1.0-beta.0",
-  "description": "TypeScript client runtime for the msgtrans wire protocol — language mapping of the Rust crate, browser-first, WebSocket transport.",
+  "version": "0.2.0-beta.0",
+  "description": "TypeScript client runtime for the msgtrans wire protocol \u2014 language mapping of the Rust crate, browser-first, WebSocket transport.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -26,7 +26,8 @@
     "test:e2e:official": "vitest run --config vitest.e2e.config.ts tests/e2e/official-echo-server.test.ts",
     "test:e2e:all": "vitest run --config vitest.e2e.config.ts",
     "sync-fixtures": "node scripts/sync-fixtures.mjs",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "api-report": "node scripts/gen-api-report.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
