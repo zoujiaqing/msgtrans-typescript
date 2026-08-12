@@ -60,5 +60,6 @@
   "publishConfig": {
     "access": "public",
     "tag": "beta"
-  }
+  },
+  "sideEffects": false
 }
