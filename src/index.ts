@@ -22,6 +22,21 @@ export type {
   TextFramePolicy,
 } from './websocket-transport.js';
 
+export {
+  WebTransportTransport,
+} from './webtransport-transport.js';
+export type {
+  WebTransportLike,
+  WebTransportFactory,
+  WebTransportTransportOptions,
+} from './webtransport-transport.js';
+
+export { HeartbeatMonitor } from './heartbeat.js';
+export type { HeartbeatOptions } from './heartbeat.js';
+
+export { ReconnectManager } from './reconnect.js';
+export type { ReconnectOptions, ReconnectPhase } from './reconnect.js';
+
 export { CodecRegistry, ZlibCodec } from './codec.js';
 export type { CompressionCodec } from './codec.js';
 

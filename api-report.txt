@@ -134,6 +134,59 @@ export declare class RequestTimeoutError extends Error {
     constructor(messageId: number, timeoutMs: number);
 }
 //# sourceMappingURL=errors.d.ts.map
+// ===== heartbeat.d.ts =====
+import type { TransportClient } from './transport-client.js';
+/**
+ * Application-layer heartbeat.
+ *
+ * msgtrans has NO protocol-level ping — a liveness probe is application
+ * traffic by design (the wire stays payload-agnostic). This monitor owns the
+ * scheduling and the verdict; the caller supplies the probe: any
+ * request/response the peer is obliged to answer.
+ */
+export interface HeartbeatOptions {
+    /**
+     * The liveness probe. Called when the connection has been idle for
+     * `intervalMs`; resolving counts as proof of life, rejecting (or exceeding
+     * `timeoutMs`) declares the connection dead. Typically a cheap
+     * request/response, e.g. `() => client.request(pingBytes, { timeoutMs })`.
+     */
+    probe: () => Promise<unknown>;
+    /** Idle time before a probe fires. Default 30_000. */
+    intervalMs?: number;
+    /** Probe deadline. Default 10_000. */
+    timeoutMs?: number;
+    /**
+     * Called when the probe fails — the connection is presumed dead. Default:
+     * `client.close()`, which lets a reconnect manager (or the app's own
+     * close handling) take over. The monitor never reconnects by itself:
+     * detection and recovery are separate jobs.
+     */
+    onDead?: (error: unknown) => void;
+}
+/**
+ * Idle-based heartbeat: traffic in EITHER direction counts as activity, so a
+ * busy connection is never probed — the probe exists to disambiguate
+ * "quiet because idle" from "quiet because dead", and only the former needs
+ * disambiguating.
+ */
+export declare class HeartbeatMonitor {
+    private readonly client;
+    private readonly probe;
+    private readonly intervalMs;
+    private readonly timeoutMs;
+    private readonly onDead;
+    private lastActivity;
+    private timer;
+    private probing;
+    private readonly unsubscribes;
+    constructor(client: TransportClient, options: HeartbeatOptions);
+    get isRunning(): boolean;
+    start(): void;
+    stop(): void;
+    private tick;
+}
+//# sourceMappingURL=heartbeat.d.ts.map
 // ===== inbound-normalizer.d.ts =====
 import { type DecodeLimits, type Packet } from './packet.js';
 import type { CodecRegistry } from './codec.js';
@@ -172,6 +225,12 @@ export { TransportState } from './transport.js';
 export type { Transport, EnqueuedInfo } from './transport.js';
 export { WebSocketTransport, DEFAULT_MAX_BUFFERED_BYTES, } from './websocket-transport.js';
 export type { WebSocketLike, WebSocketFactory, WebSocketTransportOptions, TextFramePolicy, } from './websocket-transport.js';
+export { WebTransportTransport, } from './webtransport-transport.js';
+export type { WebTransportLike, WebTransportFactory, WebTransportTransportOptions, } from './webtransport-transport.js';
+export { HeartbeatMonitor } from './heartbeat.js';
+export type { HeartbeatOptions } from './heartbeat.js';
+export { ReconnectManager } from './reconnect.js';
+export type { ReconnectOptions, ReconnectPhase } from './reconnect.js';
 export { CodecRegistry, ZlibCodec } from './codec.js';
 export type { CompressionCodec } from './codec.js';
 export { TransportClient, ClientMessage, ClientRequest, } from './transport-client.js';
@@ -268,6 +327,52 @@ export declare class Packet {
     static decodeExact(bytes: Uint8Array, limits?: DecodeLimits): Packet;
 }
 //# sourceMappingURL=packet.d.ts.map
+// ===== reconnect.d.ts =====
+import type { TransportClient } from './transport-client.js';
+export type ReconnectPhase = 'reconnecting' | 'connected' | 'gave-up';
+export interface ReconnectOptions {
+    /** Delay before the first reconnect attempt. Default 1_000. */
+    initialDelayMs?: number;
+    /** Backoff cap. Default 30_000. */
+    maxDelayMs?: number;
+    /** Per-attempt multiplier. Default 2. */
+    multiplier?: number;
+    /** Give up after this many consecutive failures. Default Infinity. */
+    maxAttempts?: number;
+    /** Observability hook; `attempt` is 1-based within the current outage. */
+    onStateChange?: (phase: ReconnectPhase, attempt: number) => void;
+}
+/**
+ * Automatic reconnection with exponential backoff.
+ *
+ * Contract, stated bluntly because every reconnect bug in this project has
+ * been a contract ambiguity:
+ *
+ * - While the handle is ACTIVE, every `close` event triggers a reconnect
+ *   cycle. An intentional disconnect must call `stop()` FIRST — the
+ *   transport cannot tell a wanted close from an unwanted one.
+ * - One cycle runs at a time; a `close` arriving mid-cycle is absorbed
+ *   (the cycle is already doing the right thing).
+ * - Backoff resets after a successful `connect()`, and the pending requests
+ *   of the old connection are NOT replayed — the transport rejected them at
+ *   close (pending state rides the connection); replay policy belongs to
+ *   the application layer, which knows what is idempotent.
+ * - `stop()` during a backoff sleep abandons the cycle at the next wake.
+ */
+export declare class ReconnectManager {
+    private readonly client;
+    private readonly opts;
+    private readonly onStateChange;
+    private active;
+    private cycleRunning;
+    private unsubscribe;
+    constructor(client: TransportClient, options?: ReconnectOptions);
+    get isActive(): boolean;
+    start(): void;
+    stop(): void;
+    private runCycle;
+}
+//# sourceMappingURL=reconnect.d.ts.map
 // ===== request-manager.d.ts =====
 import { Packet } from './packet.js';
 import type { Transport } from './transport.js';
@@ -663,3 +768,82 @@ export declare class WebSocketTransport implements Transport {
     private dispatchError;
 }
 //# sourceMappingURL=websocket-transport.d.ts.map
+// ===== webtransport-transport.d.ts =====
+import { type DecodeLimits, Packet } from './packet.js';
+import { type EnqueuedInfo, type Transport, TransportState } from './transport.js';
+/**
+ * The subset of the WebTransport API this adapter needs — injectable so
+ * tests (and non-browser hosts) can supply a fake.
+ */
+export interface WebTransportLike {
+    readonly ready: Promise<void>;
+    readonly closed: Promise<unknown>;
+    close(closeInfo?: {
+        closeCode?: number;
+        reason?: string;
+    }): void;
+    createBidirectionalStream(): Promise<{
+        readable: ReadableStream<Uint8Array>;
+        writable: WritableStream<Uint8Array>;
+    }>;
+}
+export type WebTransportFactory = (url: string) => WebTransportLike;
+export interface WebTransportTransportOptions {
+    /** https:// URL of the WebTransport endpoint. */
+    url: string;
+    /** Override the WebTransport constructor. Defaults to
+     *  `globalThis.WebTransport`. */
+    webTransportFactory?: WebTransportFactory;
+    /** Frame caps, both directions; defaults mirror the Rust 2.0 defaults. */
+    limits?: Partial<DecodeLimits>;
+}
+/**
+ * msgtrans over WebTransport (HTTP/3).
+ *
+ * Framing mirrors the Rust QUIC adapter so the two can interoperate the day
+ * a server exposes a WebTransport endpoint: ONE bidirectional stream per
+ * connection, each msgtrans frame preceded by a 4-byte big-endian length.
+ * The stream is a byte stream (unlike WebSocket's message framing), so this
+ * adapter owns reassembly: partial prefixes, partial frames and multiple
+ * frames per chunk are all normal.
+ *
+ * Semantics match the WebSocket adapter exactly:
+ * - `send()` resolves when the chunk was ACCEPTED by the stream writer
+ *   (enqueue-confirmed; the writer's promise is the platform's own
+ *   backpressure, so no separate high-water mark is layered on top).
+ * - Strict inbound: an over-limit length prefix or an undecodable frame
+ *   closes the connection.
+ * - `ReservedFlag.Fragmented` is refused (nothing implements reassembly).
+ * - Generation isolation: a previous session's late readable/closed events
+ *   cannot act on the replacement connection.
+ */
+export declare class WebTransportTransport implements Transport {
+    private readonly opts;
+    private readonly limits;
+    private session;
+    private writer;
+    private _state;
+    private readonly messageHandlers;
+    private readonly messageEnqueuedHandlers;
+    private readonly closeHandlers;
+    private readonly errorHandlers;
+    constructor(opts: WebTransportTransportOptions);
+    get state(): TransportState;
+    isConnected(): boolean;
+    connect(): Promise<void>;
+    send(packet: Packet): Promise<void>;
+    close(): Promise<void>;
+    onMessage(cb: (packet: Packet) => void): void;
+    onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void;
+    onClose(cb: (event?: unknown) => void): void;
+    onError(cb: (error: unknown) => void): void;
+    /**
+     * Reassemble length-prefixed frames from the byte stream and dispatch
+     * strictly decoded packets. Every protocol violation is fatal.
+     */
+    private readLoop;
+    private fatal;
+    private handleClose;
+    private dispatchError;
+}
+//# sourceMappingURL=webtransport-transport.d.ts.map

@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.3.0-beta.0 — 2026-08-13
+
+### Added
+
+- **`WebTransportTransport`** — msgtrans over WebTransport (HTTP/3).
+  Framing mirrors the Rust QUIC adapter (one bidirectional stream, 4-byte
+  big-endian length prefix per frame) so the two interoperate the day a
+  server exposes a WebTransport endpoint. Same contract as the WebSocket
+  adapter: strict inbound (over-limit declared length is refused BEFORE
+  buffering; undecodable frames close the connection), `Fragmented` refused,
+  session generation isolation, enqueue-confirmed sends whose await is the
+  stream's own backpressure. Injectable `webTransportFactory` for tests and
+  non-browser hosts.
+- **`HeartbeatMonitor`** — application-layer heartbeat. msgtrans has no
+  protocol-level ping, so the caller supplies the probe (any
+  request/response the peer must answer); the monitor owns idle detection
+  (traffic in either direction suppresses probing), the probe deadline, and
+  the verdict (default: close, so reconnect logic takes over). Detection and
+  recovery are deliberately separate jobs.
+- **`ReconnectManager`** — exponential-backoff reconnection with a blunt
+  contract: every `close` reconnects while active, so an intentional
+  disconnect must `stop()` first; one cycle at a time; `stop()` during a
+  backoff sleep abandons the cycle; pending requests are NOT replayed
+  (replay policy belongs to the application, which knows what is
+  idempotent).
+
+### Falsification
+
+WT generation isolation, heartbeat idle suppression, and the mid-sleep
+`stop()` check were each verified to fail their test with the guard removed.
+
 ## 0.2.0-beta.0 — 2026-08-12
 
 The msgtrans **2.0 semantic alignment**. Wire format is unchanged (protocol

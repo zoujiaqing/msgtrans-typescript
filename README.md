@@ -208,8 +208,8 @@ WebTransport will land as a separate `Transport` implementation; the existing `T
 
 - [x] **0.1.0-beta** — wire format, WebSocket transport, request/response, server-push handling
 - [x] **0.2.0-beta** — 2.0 semantic alignment: strict decode + `DecodeLimits`, transport-owned ids (no wrap), socket & respond generations, serialized inbound normalization, zlib via native streams, codec SPI (zstd injectable), honest enqueue tier, projected backpressure, API surface shrink
-- [ ] **0.3.0** — application-layer heartbeat hook packaged reconnect helpers
-- [ ] **0.4.0+** — WebTransport adapter
+- [x] **0.3.0-beta** — `HeartbeatMonitor` (caller-supplied probe, idle-based), `ReconnectManager` (backoff, blunt stop-first contract), `WebTransportTransport` (HTTP/3, Rust-QUIC-mirror framing, generation-isolated)
+- [ ] later — Zstd codec package, WebTransport server interop E2E (needs a server endpoint)
 
 ## License
 

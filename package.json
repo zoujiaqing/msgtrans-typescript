@@ -1,6 +1,6 @@
 {
   "name": "@msgtrans/client",
-  "version": "0.2.0-beta.0",
+  "version": "0.3.0-beta.0",
   "description": "TypeScript client runtime for the msgtrans wire protocol \u2014 language mapping of the Rust crate, browser-first, WebSocket transport.",
   "type": "module",
   "main": "./dist/index.js",
@@ -59,7 +59,8 @@
   ],
   "publishConfig": {
     "access": "public",
-    "tag": "beta"
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org"
   },
   "sideEffects": false
 }
