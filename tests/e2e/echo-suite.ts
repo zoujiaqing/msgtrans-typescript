@@ -34,7 +34,7 @@ export function defineEchoSuite(label: string, ctx: EchoSuiteContext): void {
       const out = await client.request(input, { bizType: 5 });
       expect(Array.from(out)).toEqual(Array.from(input));
 
-      await client.close();
+      await client.disconnect();
     });
 
     it('OneWay echoes back via on("message") with same biz_type and payload', async () => {
@@ -54,7 +54,7 @@ export function defineEchoSuite(label: string, ctx: EchoSuiteContext): void {
       expect(received[0]!.bizType).toBe(42);
       expect(Array.from(received[0]!.data)).toEqual(Array.from(input));
 
-      await client.close();
+      await client.disconnect();
     });
 
     it('100 concurrent requests resolve with their matching payloads', async () => {
@@ -74,7 +74,7 @@ export function defineEchoSuite(label: string, ctx: EchoSuiteContext): void {
         expect(Array.from(responses[i]!)).toEqual(Array.from(inputs[i]!));
       }
 
-      await client.close();
+      await client.disconnect();
     });
 
     it('Request rejects with RequestTimeoutError when server drops biz_type=250', async () => {
@@ -88,7 +88,7 @@ export function defineEchoSuite(label: string, ctx: EchoSuiteContext): void {
         }),
       ).rejects.toBeInstanceOf(RequestTimeoutError);
 
-      await client.close();
+      await client.disconnect();
     });
 
     it('close() rejects all pending requests with TransportError', async () => {
@@ -101,7 +101,7 @@ export function defineEchoSuite(label: string, ctx: EchoSuiteContext): void {
       });
 
       await new Promise((r) => setTimeout(r, 50));
-      await client.close();
+      await client.disconnect();
 
       await expect(promise).rejects.toBeInstanceOf(TransportError);
     });

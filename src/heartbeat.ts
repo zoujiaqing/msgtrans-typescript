@@ -23,7 +23,7 @@ export interface HeartbeatOptions {
   timeoutMs?: number;
   /**
    * Called when the probe fails — the connection is presumed dead. Default:
-   * `client.close()`, which lets a reconnect manager (or the app's own
+   * `client.disconnect()`, which lets a reconnect manager (or the app's own
    * close handling) take over. The monitor never reconnects by itself:
    * detection and recovery are separate jobs.
    */
@@ -69,7 +69,7 @@ export class HeartbeatMonitor {
     this.onDead =
       options.onDead ??
       (() => {
-        void this.client.close();
+        void this.client.disconnect();
       });
   }
 
@@ -79,6 +79,8 @@ export class HeartbeatMonitor {
 
   start(): void {
     if (this.timer) return;
+    this.epoch += 1; // a fresh lifecycle owns a fresh probing flag
+    this.probing = false;
     this.lastActivity = Date.now();
     const bump = () => {
       this.lastActivity = Date.now();
@@ -122,13 +124,18 @@ export class HeartbeatMonitor {
     const epoch = this.epoch;
     try {
       await withDeadline(this.probe(), this.timeoutMs);
+      // Success from a DEAD epoch is as void as failure: it must not bump
+      // the restarted cycle's activity clock.
+      if (epoch !== this.epoch) return;
       this.lastActivity = Date.now();
     } catch (e) {
       if (epoch !== this.epoch) return; // stale verdict: stop() ran meanwhile
       this.stop();
       this.onDead(e);
     } finally {
-      this.probing = false;
+      // Only the CURRENT epoch owns the probing flag; a hung old probe's
+      // eventual settle must not unblock (or keep blocked) the new cycle.
+      if (epoch === this.epoch) this.probing = false;
     }
   }
 }

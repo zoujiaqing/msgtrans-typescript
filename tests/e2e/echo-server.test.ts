@@ -47,7 +47,7 @@ describe('E2E zlib interop — real Rust 2.0 compression on both sides', () => {
       timeoutMs: 10_000,
     });
     expect(decode(response)).toBe(body);
-    await client.close();
+    await client.disconnect();
   });
 
   it('Rust compressed RESPONSE (respond_with_options) → TS delivers plaintext', async () => {
@@ -59,7 +59,7 @@ describe('E2E zlib interop — real Rust 2.0 compression on both sides', () => {
       timeoutMs: 10_000,
     });
     expect(decode(response)).toBe(body);
-    await client.close();
+    await client.disconnect();
   });
 
   it('Rust compressed PUSH (send_data_with_options) → TS message is plaintext', async () => {
@@ -75,6 +75,6 @@ describe('E2E zlib interop — real Rust 2.0 compression on both sides', () => {
       await new Promise((r) => setTimeout(r, 20));
     }
     expect(received).toEqual([body]);
-    await client.close();
+    await client.disconnect();
   });
 });

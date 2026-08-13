@@ -257,31 +257,36 @@ describe('RequestManager — reset', () => {
     expect(m.pendingCount).toBe(0);
   });
 
-  it('rejects pending on transport.onClose', async () => {
+  it('reset() rejects pending — the manager no longer self-subscribes to close', async () => {
+    // A manager belongs to ONE session; the session's owner resets it.
+    // Self-subscribing leaked a listener per reconnect (the Transport SPI
+    // has no unsubscribe) and re-created shared-mutable coupling.
     const t = new FakeTransport();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket());
+    await Promise.resolve();
 
-    t.fireClose();
+    m.reset(new TransportError('transport closed'));
 
     await expect(promise).rejects.toBeInstanceOf(TransportError);
     expect(m.pendingCount).toBe(0);
   });
 
-  it('a non-fatal transport error does NOT reject pending (only close does)', async () => {
-    // Old behavior reset ALL pending on any transport error, so a single
-    // recoverable error nuked every in-flight request while the connection
-    // stayed healthy. Protocol violations now close the connection at the
-    // transport layer; pending state rides the connection, nothing else.
+  it('transport events do NOT touch pending — only the owner does', async () => {
+    // The manager has no transport subscriptions at all: a session owns it
+    // and resets it. Errors and even close events on the transport leave the
+    // manager untouched until the owner acts (TransportClient retires the
+    // session on close and resets its manager there).
     const t = new FakeTransport();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket());
     await Promise.resolve();
 
     t.fireError(new Error('socket hiccup'));
-    expect(m.pendingCount).toBe(1); // untouched
-
     t.fireClose();
+    expect(m.pendingCount).toBe(1); // untouched — no self-subscription
+
+    m.reset(new TransportError('transport closed'));
     await expect(promise).rejects.toThrow('transport closed');
     expect(m.pendingCount).toBe(0);
   });

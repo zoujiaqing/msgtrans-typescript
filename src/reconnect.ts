@@ -1,6 +1,7 @@
 import type { TransportClient } from './transport-client.js';
 import {
-  requireAtLeast,
+  requireAttempts,
+  requireFiniteAtLeast,
   requireNonNegativeFinite,
   requireRatio,
 } from './validate.js';
@@ -56,6 +57,13 @@ export class ReconnectManager {
 
   private active = false;
   private cycleRunning = false;
+  /**
+   * Lifecycle epoch: bumped by every start() and stop(). A cycle belongs to
+   * the epoch it started in — after stop();start() during its backoff sleep,
+   * the OLD cycle wakes into a mismatched epoch and abandons itself instead
+   * of zombie-connecting under the new lifecycle's `active` flag.
+   */
+  private epoch = 0;
   private unsubscribe: (() => void) | null = null;
 
   constructor(client: TransportClient, options: ReconnectOptions = {}) {
@@ -69,8 +77,8 @@ export class ReconnectManager {
         'maxDelayMs',
         options.maxDelayMs ?? 30_000,
       ),
-      multiplier: requireAtLeast('multiplier', options.multiplier ?? 2, 1),
-      maxAttempts: requireAtLeast('maxAttempts', options.maxAttempts ?? Infinity, 1),
+      multiplier: requireFiniteAtLeast('multiplier', options.multiplier ?? 2, 1),
+      maxAttempts: requireAttempts('maxAttempts', options.maxAttempts ?? Infinity),
       jitterRatio: requireRatio('jitterRatio', options.jitterRatio ?? 0.2),
     };
     this.onStateChange = options.onStateChange ?? (() => {});
@@ -83,6 +91,7 @@ export class ReconnectManager {
   start(): void {
     if (this.active) return;
     this.active = true;
+    this.epoch += 1;
     this.unsubscribe = this.client.on('close', () => {
       void this.runCycle();
     });
@@ -90,6 +99,7 @@ export class ReconnectManager {
 
   stop(): void {
     this.active = false;
+    this.epoch += 1;
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = null;
@@ -106,12 +116,13 @@ export class ReconnectManager {
       return;
     }
     this.cycleRunning = true;
+    const epoch = this.epoch;
     try {
       let delay = this.opts.initialDelayMs;
       for (let attempt = 1; attempt <= this.opts.maxAttempts; attempt++) {
         this.onStateChange('reconnecting', attempt);
         await sleep(this.jittered(delay));
-        if (!this.active) return; // stopped during backoff
+        if (this.epoch !== epoch) return; // stopped/restarted during backoff
         try {
           await this.client.connect();
           this.onStateChange('connected', attempt);
@@ -126,7 +137,7 @@ export class ReconnectManager {
       this.cycleRunning = false;
       if (this.pendingRerun) {
         this.pendingRerun = false;
-        if (this.active && !this.client.isConnected()) {
+        if (this.epoch === epoch && this.active && !this.client.isConnected()) {
           void this.runCycle();
         }
       }

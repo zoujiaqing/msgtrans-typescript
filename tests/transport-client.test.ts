@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  ClientMessage,
-  ClientRequest,
+  type ClientMessage,
+  type ClientRequest,
   CompressionType,
   Packet,
   PacketType,
@@ -40,7 +40,7 @@ describe('TransportClient — lifecycle', () => {
     const c = newClient(t);
     await c.connect();
     expect(t.connectCalls).toHaveLength(1);
-    await c.close();
+    await c.disconnect();
     expect(t.closeCalls).toHaveLength(1);
   });
 
@@ -124,7 +124,7 @@ describe('TransportClient — message routing', () => {
     expect(msg.bizType).toBe(3);
     expect(msg.messageId).toBe(555);
     expect(new TextDecoder().decode(msg.data)).toBe('hi');
-    expect(msg).toBeInstanceOf(ClientMessage);
+    expect(msg.kind).toBe('message');
   });
 
   it('Response packets matching pending request do NOT trigger message event', async () => {
@@ -258,7 +258,7 @@ describe('TransportClient — message routing', () => {
     await c.connect(); // new generation
 
     await expect(captured!.respond(new Uint8Array())).rejects.toThrow(
-      /generation/,
+      /connection changed/,
     );
     expect(t.sent).toHaveLength(0); // nothing reached the wire
   });

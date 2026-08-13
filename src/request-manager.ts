@@ -52,13 +52,10 @@ export class RequestManager {
       options.initialMessageId ?? 1,
     );
     this.counter = this.initialMessageId;
-
-    // Pending state rides the CONNECTION, so it resets exactly when the
-    // connection ends — and only then. (It used to also reset on every
-    // transport error, so a single non-fatal error nuked all in-flight
-    // requests while the connection stayed healthy. Protocol violations now
-    // close the connection at the transport layer, which lands here.)
-    transport.onClose(() => this.reset(new TransportError('transport closed')));
+    // NO transport subscriptions: a manager belongs to ONE session and the
+    // session's owner resets it. Subscribing here would leak one listener
+    // per reconnect (the Transport SPI has no unsubscribe) and re-create the
+    // shared-mutable coupling the session model removes.
   }
 
   get pendingCount(): number {

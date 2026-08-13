@@ -72,7 +72,7 @@ export class InboundNormalizer {
     // past a cap — overflow closes the connection.
     if (
       this.depth + 1 > this.caps.maxFrames ||
-      this.queuedBytes + packet.payload.length > this.caps.maxBytes
+      this.queuedBytes + packet.totalLength() > this.caps.maxBytes
     ) {
       this.poisoned = true;
       fatal(
@@ -83,8 +83,8 @@ export class InboundNormalizer {
       return;
     }
     this.depth += 1;
-    this.queuedBytes += packet.payload.length;
-    const size = packet.payload.length;
+    const size = packet.totalLength();
+    this.queuedBytes += size;
     this.chain = this.chain.then(async () => {
       if (this.poisoned) {
         this.depth -= 1;
@@ -103,6 +103,11 @@ export class InboundNormalizer {
       }
       this.depth -= 1;
       this.queuedBytes -= size;
+      // Re-check AFTER the await: poisoning may have happened (e.g. a queue
+      // overflow behind us) while this packet was inside its decompression.
+      // A poisoned stream delivers NOTHING, including the packet that was
+      // already in flight when the verdict landed.
+      if (this.poisoned) return;
       deliver(normalized);
     });
   }

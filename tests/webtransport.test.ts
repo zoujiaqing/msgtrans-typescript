@@ -234,6 +234,6 @@ describe('WebTransportTransport — under a full TransportClient', () => {
     const response = await client.request(text('ask'), { timeoutMs: 5_000 });
     expect(decode(response)).toBe('answered over WT');
     await serve;
-    await client.close();
+    await client.disconnect();
   });
 });

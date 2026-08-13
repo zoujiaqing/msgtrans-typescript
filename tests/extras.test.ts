@@ -124,7 +124,7 @@ describe('ReconnectManager', () => {
 
     rm.stop(); // the documented contract for intentional disconnects
     const before = t.connectCalls.length;
-    await c.close();
+    await c.disconnect();
     t.fireClose();
     await sleep(80);
     expect(t.connectCalls.length).toBe(before);

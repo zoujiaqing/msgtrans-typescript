@@ -3,7 +3,6 @@
 // the pre-fix implementation), then fixed.
 import { describe, expect, it } from 'vitest';
 import {
-  ClientRequest,
   CompressionType,
   Packet,
   PacketType,
@@ -251,15 +250,9 @@ describe('P1: stale async results cannot fire', () => {
 });
 
 describe('P1: sealed handles and validated config', () => {
-  it('ClientRequest is not constructible by consumers', async () => {
-    expect(
-      () =>
-        new (ClientRequest as unknown as new (...args: unknown[]) => unknown)(
-          Packet.oneWay(1),
-          {},
-          0,
-        ),
-    ).toThrow();
+  it('ClientRequest is not even a VALUE any more (interface-only export)', async () => {
+    const api = await import('../src/index.js');
+    expect((api as Record<string, unknown>)['ClientRequest']).toBeUndefined();
   });
 
   it('NaN limits are rejected instead of disabling the bomb defense', () => {

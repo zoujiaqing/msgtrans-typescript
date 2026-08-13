@@ -10,6 +10,7 @@ import {
   type Transport,
   TransportState,
 } from './transport.js';
+import { requireNonNegativeFinite } from './validate.js';
 
 export interface WebSocketLike {
   binaryType: string;
@@ -101,6 +102,9 @@ export class WebSocketTransport implements Transport {
   private connectReject: ((e: unknown) => void) | null = null;
 
   constructor(opts: WebSocketTransportOptions) {
+    if (opts.maxBufferedBytes !== undefined) {
+      requireNonNegativeFinite('maxBufferedBytes', opts.maxBufferedBytes);
+    }
     this.opts = opts;
     this.limits = normalizeDecodeLimits(opts.limits);
   }
@@ -255,22 +259,26 @@ export class WebSocketTransport implements Transport {
     }
     const wasConnecting = this._state === TransportState.Connecting;
     this._state = TransportState.Closing;
+    // DETACH FIRST: from here on, every late platform event on this socket —
+    // onclose, onerror, and crucially a late onopen — fails its isCurrent()
+    // check and cannot revive the state machine. Deterministic close does
+    // not depend on the platform ever firing onclose.
+    const ws = this.ws;
+    this.ws = null;
     try {
-      this.ws?.close();
+      ws?.close();
     } catch {
       /* the deterministic close below still runs */
     }
     if (wasConnecting) {
       // CANCEL SAFETY: a close during the handshake must settle the pending
-      // connect() — a hung handshake may never fire onclose, and the old
-      // behavior left that promise pending FOREVER (the state had already
-      // left Connecting, so the eventual onclose no longer rejected it).
+      // connect() — a hung handshake may never fire onclose.
       const reject = this.connectReject;
       this.connectResolve = null;
       this.connectReject = null;
       reject?.(new TransportError('connection closed during connect'));
-      this.handleClose({ reason: 'closed during connect' });
     }
+    this.handleClose({ reason: 'closed locally' });
     return Promise.resolve();
   }
 
@@ -348,11 +356,18 @@ export class WebSocketTransport implements Transport {
 
   private handleError(ev: unknown): void {
     this.dispatchError(ev);
-    if (this._state === TransportState.Connecting && this.connectReject) {
+    if (this._state === TransportState.Connecting) {
+      // A handshake error is TERMINAL for this attempt, whether or not the
+      // platform ever follows up with onclose: reject the pending connect,
+      // detach the socket and land in Closed — the old behavior stayed in
+      // Connecting and handed every later connect() the same rejected
+      // promise.
       const reject = this.connectReject;
       this.connectResolve = null;
       this.connectReject = null;
-      reject(ev instanceof Error ? ev : new TransportError('WebSocket error'));
+      reject?.(ev instanceof Error ? ev : new TransportError('WebSocket error'));
+      this.ws = null;
+      this.handleClose({ reason: 'error during connect' });
     }
   }
 

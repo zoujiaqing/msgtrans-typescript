@@ -4,13 +4,13 @@ TypeScript client runtime for the [msgtrans](https://github.com/zoujiaqing/msgtr
 
 `@msgtrans/client` is the language mapping of the `msgtrans` Rust client surface — same Packet semantics, same Request/Response correlation rules, same wire bytes. The wire format is defined by [`WIRE_FORMAT.md`](https://github.com/zoujiaqing/msgtrans/blob/main/docs/WIRE_FORMAT.md) and conformance is verified by a shared cross-language fixture suite.
 
-> **Status: 0.4.0-beta.0** — 2.0 semantic alignment + lifecycle hardening: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
+> **Status: 0.5.0-beta.0** — 2.0 semantic alignment + session-ownership lifecycle: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
 >
 > **Compatibility matrix**
 >
 > | @msgtrans/client | msgtrans (Rust) | Wire protocol |
 > |---|---|---|
-> | 0.2.x – 0.4.x | 2.0.x | v1 |
+> | 0.2.x – 0.5.x | 2.0.x | v1 |
 > | 0.1.x | 1.0.x / 2.0.x | v1 |
 >
 > The version numbers deliberately do NOT lock step with the Rust crate: this is a browser, single-connection client, not a full mapping of the Rust server architecture. What IS aligned: the wire format, the request lifecycle, strict decoding, and the error semantics.
@@ -180,7 +180,7 @@ interface RequestOptions extends SendOptions {
 
 - No `TransportClientBuilder` — options object is more natural in TS
 - Event delivery is callback-based, not a `subscribe_events()` stream — same information, JS-idiomatic shape
-- Browser `WebSocket` cannot send raw ping/pong frames, so Rust's `with_ping_interval` / `with_pong_timeout` is not exposed; application-layer heartbeat will land in v0.2 with an explicit `heartbeatPacketFactory` hook
+- Browser `WebSocket` cannot send raw ping/pong frames, so Rust's `with_ping_interval` / `with_pong_timeout` is not exposed; use `HeartbeatMonitor` with a caller-supplied probe (any request/response the peer must answer)
 
 ## Wire format
 
@@ -188,7 +188,7 @@ interface RequestOptions extends SendOptions {
 
 - 16-byte fixed header, big-endian
 - Three packet types: `OneWay` / `Request` / `Response`
-- Compression byte is part of the header but compression itself is currently treated by the client as opaque (the bytes are passed through; an upper layer can apply zlib/zstd)
+- Compression is REAL, both directions: zlib via native streams by default, Zstd injectable via the codec SPI; inbound bodies are decompressed at the transport boundary (never handed to the app compressed), outbound compression is applied before enqueue
 - Each WebSocket binary frame carries exactly one Packet — no length-prefix framing is needed at this layer
 
 Cross-language conformance is enforced: every release runs the same fixture set on both the Rust crate and this package, and asserts byte-for-byte equality in both directions.
@@ -198,11 +198,11 @@ Cross-language conformance is enforced: every release runs the same fixture set 
 | Transport | Browser | Node | Status |
 |---|---|---|---|
 | WebSocket | ✅ native | ✅ via `webSocketFactory` (e.g. `ws`) | **supported** |
-| WebTransport (HTTP/3) | ✅ in modern Chromium / Firefox / Safari | — | roadmap (separate adapter) |
+| WebTransport (HTTP/3) | ✅ in modern Chromium / Firefox / Safari | — | **experimental** — `@msgtrans/client/experimental`, pending server interop E2E |
 | TCP | — | — | not in scope (browser cannot do raw TCP) |
 | QUIC (raw) | — | — | not in scope (no browser API) |
 
-WebTransport will land as a separate `Transport` implementation; the existing `TransportClient` API stays stable.
+`WebTransportTransport` exists today behind the `experimental` subpath (Rust-QUIC-mirror framing); it graduates to the root API once a real server interop E2E exists.
 
 ## Roadmap
 

@@ -107,6 +107,18 @@ export declare class BackpressureError extends TransportError {
     constructor(bufferedAmount: number, maxBufferedBytes: number);
 }
 /**
+ * An internal async queue (inbound normalization or the outbound compression
+ * chain) hit its frame or byte cap. Distinct from `BackpressureError` (the
+ * SOCKET's outbound buffer): the fields here are queue occupancy, not socket
+ * bytes.
+ */
+export declare class QueueOverflowError extends TransportError {
+    readonly direction: 'inbound' | 'outbound';
+    readonly frames: number;
+    readonly bytes: number;
+    constructor(direction: 'inbound' | 'outbound', frames: number, bytes: number);
+}
+/**
  * No codec is available for the requested compression algorithm.
  *
  * On SEND this rejects the call — a raw payload is never shipped under a
@@ -163,7 +175,7 @@ export interface HeartbeatOptions {
     timeoutMs?: number;
     /**
      * Called when the probe fails — the connection is presumed dead. Default:
-     * `client.close()`, which lets a reconnect manager (or the app's own
+     * `client.disconnect()`, which lets a reconnect manager (or the app's own
      * close handling) take over. The monitor never reconnects by itself:
      * detection and recovery are separate jobs.
      */
@@ -211,9 +223,10 @@ export { ReconnectManager } from './reconnect.js';
 export type { ReconnectOptions, ReconnectPhase } from './reconnect.js';
 export { CodecRegistry, ZlibCodec } from './codec.js';
 export type { CompressionCodec } from './codec.js';
-export { TransportClient, ClientMessage, ClientRequest, } from './transport-client.js';
+export { TransportClient } from './transport-client.js';
+export type { ClientMessage, ClientRequest } from './transport-client.js';
 export type { TransportClientOptions, ConnectRetryOptions, SendOptions, RequestOptions, } from './transport-client.js';
-export { WireFormatError, UnsupportedVersionError, IncompletePacketError, UnknownWireValueError, DecodeLimitError, TransportError, BackpressureError, UnsupportedCompressionError, IdExhaustedError, RequestTimeoutError, } from './errors.js';
+export { WireFormatError, UnsupportedVersionError, IncompletePacketError, UnknownWireValueError, DecodeLimitError, TransportError, BackpressureError, QueueOverflowError, UnsupportedCompressionError, IdExhaustedError, RequestTimeoutError, } from './errors.js';
 export { FIXED_HEADER_LEN, PROTOCOL_VERSION, WIRE_MAX_EXT_HEADER_LEN, WIRE_MAX_PAYLOAD_LEN, DEFAULT_MAX_PAYLOAD_LEN, DEFAULT_MAX_EXT_HEADER_LEN, } from './constants.js';
 //# sourceMappingURL=index.d.ts.map
 // ===== packet.d.ts =====
@@ -360,6 +373,13 @@ export declare class ReconnectManager {
     private readonly onStateChange;
     private active;
     private cycleRunning;
+    /**
+     * Lifecycle epoch: bumped by every start() and stop(). A cycle belongs to
+     * the epoch it started in — after stop();start() during its backoff sleep,
+     * the OLD cycle wakes into a mismatched epoch and abandons itself instead
+     * of zombie-connecting under the new lifecycle's `active` flag.
+     */
+    private epoch;
     private unsubscribe;
     constructor(client: TransportClient, options?: ReconnectOptions);
     get isActive(): boolean;
@@ -370,7 +390,7 @@ export declare class ReconnectManager {
 }
 //# sourceMappingURL=reconnect.d.ts.map
 // ===== transport-client.d.ts =====
-import { CompressionType, type DecodeLimits, Packet } from './packet.js';
+import { CompressionType, type DecodeLimits } from './packet.js';
 import { type CompressionCodec } from './codec.js';
 import type { EnqueuedInfo, Transport } from './transport.js';
 import { type TextFramePolicy, type WebSocketFactory } from './websocket-transport.js';
@@ -408,18 +428,21 @@ export interface TransportClientOptions {
     limits?: Partial<DecodeLimits>;
     /**
      * Inbound normalization queue caps (packets queued behind an in-flight
-     * decompression). Overflow closes the connection: the browser cannot
-     * pause the socket, but it can refuse to buffer without limit.
+     * decompression; bytes counted as full frame size — header + ext +
+     * payload). Overflow closes the connection: the browser cannot pause the
+     * socket, but it can refuse to buffer without limit.
      * Defaults: 8192 frames / 64 MiB.
      */
     maxInboundQueueFrames?: number;
     maxInboundQueueBytes?: number;
     /**
-     * Outbound chain cap (sends queued behind an in-flight compression).
-     * Exceeding it rejects the send with `BackpressureError` — the
-     * connection stays healthy. Default 8192.
+     * Outbound chain caps (sends queued behind an in-flight compression), in
+     * operations AND captured payload bytes. Exceeding either rejects the
+     * send with `QueueOverflowError` — the connection stays healthy.
+     * Defaults: 8192 ops / 64 MiB.
      */
     maxOutboundQueue?: number;
+    maxOutboundQueueBytes?: number;
     /**
      * Additional compression codecs. `ZlibCodec` (native
      * Compression/DecompressionStream) is always registered; entries here can
@@ -427,17 +450,10 @@ export interface TransportClientOptions {
      */
     codecs?: readonly CompressionCodec[];
     /**
-     * Connect-time retry policy. Default: no retry (one attempt only).
-     *
-     * This is the language mapping of the Rust crate's `RetryConfig`. It
-     * covers the *initial* `connect()` failure path — DNS / WebSocket
-     * handshake / cold-start network blips — not auto-reconnect after a
-     * dropped connection, which is the consuming SDK's responsibility
-     * (`@privchat/sdk` runs its own `ReconnectOptions` state machine on
-     * top of this transport).
-     *
-     * Default 0 retries preserves the original single-attempt behavior.
-     * Opt in by passing `{ maxRetries: N, ... }`.
+     * Connect-time retry policy for a SINGLE `connect()` call. Default: no
+     * retry (one attempt). When running a `ReconnectManager` on top, leave
+     * this at its zero default — stacking both multiplies attempt counts and
+     * wait times; the manager is THE retry policy.
      */
     connectRetry?: ConnectRetryOptions;
 }
@@ -446,16 +462,9 @@ export interface TransportClientOptions {
  *
  *   - `maxRetries`: number of ADDITIONAL attempts after the first one
  *     fails. Total attempts = `maxRetries + 1`. Default 0 (no retry).
- *   - `initialDelayMs`: delay before the FIRST retry (i.e. after attempt #0
- *     fails, before attempt #1). Default 100.
+ *   - `initialDelayMs`: delay before the FIRST retry. Default 100.
  *   - `maxDelayMs`: cap applied after exponential growth. Default 10_000.
  *   - `multiplier`: per-attempt backoff multiplier. Default 2.
- *
- * Delay formula for attempt `n` (1-indexed retry): `min(maxDelayMs,
- * initialDelayMs * multiplier^(n - 1))`.
- *
- * Retry is unconditional — any `transport.connect()` rejection triggers
- * a retry until `maxRetries` is exhausted. The last error is rethrown.
  */
 export interface ConnectRetryOptions {
     maxRetries?: number;
@@ -463,76 +472,107 @@ export interface ConnectRetryOptions {
     maxDelayMs?: number;
     multiplier?: number;
 }
+/** A one-way message delivered to the application. Always plaintext: the
+ *  inbound normalizer has already undone any compression. */
+export interface ClientMessage {
+    readonly kind: 'message';
+    readonly payload: Uint8Array;
+    /** Alias for `payload`. */
+    readonly data: Uint8Array;
+    readonly bizType: number;
+    readonly messageId: number;
+    readonly extHeader: Uint8Array;
+}
+/**
+ * A request delivered to the client that carries the obligation to answer.
+ * An INTERFACE by design: the implementation is not exported, so no consumer
+ * can construct one and respond with an arbitrary messageId — the forgeable
+ * handle Rust 2.0 makes unrepresentable. `respond()` answers at most once,
+ * and only onto the connection session it arrived on.
+ */
+export interface ClientRequest {
+    readonly kind: 'request';
+    readonly payload: Uint8Array;
+    /** Alias for `payload`. */
+    readonly data: Uint8Array;
+    readonly bizType: number;
+    readonly messageId: number;
+    readonly extHeader: Uint8Array;
+    readonly hasResponded: boolean;
+    respond(payload: Uint8Array, options?: SendOptions): Promise<void>;
+}
 export declare class TransportClient {
     private readonly transport;
-    private readonly requestManager;
     private readonly limits;
     private readonly codecs;
-    private normalizer;
+    private readonly defaultTimeoutMs;
     private readonly inboundCaps;
     private readonly maxOutboundQueue;
+    private readonly maxOutboundQueueBytes;
     private readonly messageListeners;
-    private readonly requestListeners;
+    private requestListener;
     private readonly messageEnqueuedListeners;
     private readonly closeListeners;
     private readonly errorListeners;
     private readonly retryOpts;
-    /**
-     * Program-order guarantee for the outbound path. Compression is async, so
-     * without serialization `send(a, {compression}); send(b);` would put `b`
-     * on the wire first — the outbound mirror of the inbound reordering the
-     * normalizer chain prevents. Every outbound packet passes through this
-     * chain; a plain send behind a compressing one waits for it, exactly as
-     * Rust's inline `SendOptions::apply` on the send path.
-     */
-    private outboundChain;
-    /** Outbound packets queued or in flight on the chain. */
-    private outboundDepth;
-    /**
-     * Connection generation, bumped on every close. A `ClientRequest` captures
-     * the generation it arrived on; its `respond()` refuses to write onto a
-     * LATER connection — the client-side mapping of Rust 2.0's
-     * generation-bound respond claims.
-     */
-    private generation;
+    /** The CURRENT connection's ownership unit. Replaced atomically on every
+     *  real (re)connect; everything async captures the session it started on
+     *  and is refused once that object is no longer current. */
+    private session;
+    /** Single-flight guard: concurrent `connect()` calls share one attempt,
+     *  so two completion paths can never each install a session (the id-ABA
+     *  the seventh review reproduced). */
+    private connectFlight;
+    private terminated;
     constructor(options: TransportClientOptions);
     /**
      * Open the transport with optional retry-on-failure.
      *
-     * Attempt 0 runs immediately. If it rejects and `connectRetry.maxRetries
-     * > 0`, the transport is `close()`d (defensively, to reset any
-     * mid-Connecting state that would otherwise cause subsequent
-     * `transport.connect()` calls to return the prior rejected promise),
-     * a backoff delay is applied, and another attempt is made — up to
-     * `maxRetries` additional times. The final attempt's rejection is
-     * thrown verbatim.
+     * Idempotent on a live connection, single-flight under concurrency: any
+     * number of overlapping `connect()` calls share ONE attempt and observe
+     * its outcome, and exactly one new session is installed per real
+     * (re)connection.
      */
     connect(): Promise<void>;
-    /** Close the underlying transport. Alias: `disconnect()`. */
-    close(): Promise<void>;
-    /** Alias for `close()` — matches Rust `TransportClient::disconnect()`. */
+    private doConnect;
+    /**
+     * End the current connection. Reconnecting afterwards is allowed —
+     * this is the "hang up" verb, not the "destroy the client" one.
+     */
     disconnect(): Promise<void>;
+    /**
+     * Terminal shutdown: disconnects and refuses every future `connect()`.
+     * Use `disconnect()` for a connection you intend to re-establish.
+     */
+    shutdown(): Promise<void>;
     isConnected(): boolean;
     /**
      * One-way send. Resolves when the packet was ACCEPTED by the socket's
      * outbound buffer (enqueue-confirmed — a browser WebSocket offers no
      * write confirmation, and this API does not pretend otherwise).
+     *
+     * SESSION-BOUND: the send belongs to the connection that was current when
+     * it was CALLED. If the connection turns over while (async) compression
+     * runs, the send is refused — completing it would silently replay a
+     * request the application never chose to retry.
      */
     send(payload: Uint8Array, options?: SendOptions): Promise<void>;
     request(payload: Uint8Array, options?: RequestOptions): Promise<Uint8Array>;
-    /** Respond path, reachable only through the closure handed to
-     *  `ClientRequest` at construction. */
-    private respondTo;
     on(event: 'message', cb: (msg: ClientMessage) => void): () => void;
     on(event: 'request', cb: (req: ClientRequest) => void): () => void;
     on(event: 'messageEnqueued', cb: (info: EnqueuedInfo) => void): () => void;
     on(event: 'close', cb: (event?: unknown) => void): () => void;
     on(event: 'error', cb: (error: unknown) => void): () => void;
+    private newSession;
+    private retireSession;
+    private requireCurrent;
     private handleIncoming;
     private route;
+    private respondTo;
     private buildOutbound;
     /** Sync bypass is safe only when there is no codec work AND nothing is
-     *  queued on the chain (otherwise this packet would overtake it). */
+     *  queued on the session's chain (otherwise this packet would overtake
+     *  it) AND the session is still current. */
     private canBypassChain;
     /** Synchronous packet construction for the no-compression path. */
     private buildPlain;
@@ -541,51 +581,6 @@ export declare class TransportClient {
     private dispatchClose;
     private dispatchError;
 }
-/** A one-way message delivered to the application. Always plaintext: the
- *  inbound normalizer has already undone any compression. */
-export declare class ClientMessage {
-    private readonly packet;
-    /** @internal — constructed by the transport only. */
-    constructor(token: unknown, packet: Packet);
-    get payload(): Uint8Array;
-    /** Alias for `payload`. */
-    get data(): Uint8Array;
-    get bizType(): number;
-    get messageId(): number;
-    get extHeader(): Uint8Array;
-}
-/**
- * A request delivered to the client that carries the obligation to answer —
- * the TS mapping of Rust 2.0's `ClientRequest`. `respond()` answers it at
- * most once (runtime-enforced; TS cannot consume ownership at the type
- * level), and only onto the connection generation it arrived on: a stale
- * response written after a reconnect could complete a DIFFERENT server-side
- * request that drew the same id.
- */
-interface RespondPath {
-    isCurrent: () => boolean;
-    respond: (request: ClientRequest, payload: Uint8Array, options: SendOptions) => Promise<void>;
-}
-export declare class ClientRequest {
-    private respondedFlag;
-    private readonly packet;
-    private readonly path;
-    /** @internal — constructed by the transport only. An externally
-     *  constructible ClientRequest could respond with an arbitrary messageId,
-     *  which is exactly the forgeable handle this type exists to prevent. */
-    constructor(token: unknown, packet: Packet, path: RespondPath);
-    /** @internal */
-    stillCurrent(): boolean;
-    get payload(): Uint8Array;
-    /** Alias for `payload`. */
-    get data(): Uint8Array;
-    get bizType(): number;
-    get messageId(): number;
-    get extHeader(): Uint8Array;
-    get hasResponded(): boolean;
-    respond(payload: Uint8Array, options?: SendOptions): Promise<void>;
-}
-export {};
 //# sourceMappingURL=transport-client.d.ts.map
 // ===== transport.d.ts =====
 import type { Packet } from './packet.js';

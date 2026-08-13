@@ -31,11 +31,8 @@ export type { ReconnectOptions, ReconnectPhase } from './reconnect.js';
 export { CodecRegistry, ZlibCodec } from './codec.js';
 export type { CompressionCodec } from './codec.js';
 
-export {
-  TransportClient,
-  ClientMessage,
-  ClientRequest,
-} from './transport-client.js';
+export { TransportClient } from './transport-client.js';
+export type { ClientMessage, ClientRequest } from './transport-client.js';
 export type {
   TransportClientOptions,
   ConnectRetryOptions,
@@ -51,6 +48,7 @@ export {
   DecodeLimitError,
   TransportError,
   BackpressureError,
+  QueueOverflowError,
   UnsupportedCompressionError,
   IdExhaustedError,
   RequestTimeoutError,

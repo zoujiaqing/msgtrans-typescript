@@ -81,6 +81,27 @@ export class BackpressureError extends TransportError {
 }
 
 /**
+ * An internal async queue (inbound normalization or the outbound compression
+ * chain) hit its frame or byte cap. Distinct from `BackpressureError` (the
+ * SOCKET's outbound buffer): the fields here are queue occupancy, not socket
+ * bytes.
+ */
+export class QueueOverflowError extends TransportError {
+  readonly direction: 'inbound' | 'outbound';
+  readonly frames: number;
+  readonly bytes: number;
+  constructor(direction: 'inbound' | 'outbound', frames: number, bytes: number) {
+    super(
+      `${direction} queue overflow: ${frames} frames / ${bytes} bytes queued`,
+    );
+    this.name = 'QueueOverflowError';
+    this.direction = direction;
+    this.frames = frames;
+    this.bytes = bytes;
+  }
+}
+
+/**
  * No codec is available for the requested compression algorithm.
  *
  * On SEND this rejects the call — a raw payload is never shipped under a

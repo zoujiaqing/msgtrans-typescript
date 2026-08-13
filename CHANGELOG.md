@@ -6,6 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.5.0-beta.0 — 2026-08-14
+
+Session-ownership rework (seventh review). The prior claim that per-promise
+generation checks matched the Connector/Session semantics was WRONG — six
+reviewer-reproduced counterexamples proved it — so ownership is now
+structural: an internal `Session` object owns the id allocator, request
+manager, inbound normalizer and outbound queue, and retiring it voids every
+piece of in-flight async work at once, with no dependence on adapters
+firing events.
+
+### Fixed
+
+- **P0** Async sends cannot cross a reconnect: every send/request/respond is
+  bound to the session it was CALLED on; if the connection turns over during
+  async compression, the operation is refused (no silent replay of
+  non-idempotent requests).
+- **P0** `connect()` is single-flight: concurrent calls share one attempt,
+  so two completion paths can never each install a session (the id-ABA).
+- **P0** Ownership no longer depends on the adapter emitting `close`:
+  `disconnect()` retires the session directly, and a (re)connect installs a
+  fresh one — a custom Transport that never fires `onClose` cannot leak old
+  async work into the replacement connection.
+- **P0** WebSocket state cannot be revived: `close()` detaches the socket
+  (a late `onopen` fails `isCurrent()`), and a handshake `onerror` without
+  `onclose` lands in Closed instead of wedging Connecting and replaying the
+  same rejected promise to every later `connect()`.
+- **P1** Poisoning covers the packet already inside its decompression when
+  the verdict lands (post-await recheck).
+- **P1** Helper epochs are complete: a stale probe's SUCCESS is as void as
+  its failure, a hung probe cannot pin the restarted monitor's `probing`
+  flag, and a reconnect cycle abandoned by `stop();start()` cannot
+  zombie-connect under the new lifecycle's flag.
+- **P1** Validation covers `connectRetry` (integer maxRetries — `-1` used to
+  make `connect()` throw `undefined`), `multiplier` (finite), `maxAttempts`
+  (integer or Infinity), `defaultTimeoutMs`, per-request `timeoutMs`, and
+  `maxBufferedBytes`.
+- **P2** Queue caps count full frame bytes on inbound; outbound is capped in
+  ops AND bytes; overflow raises the new `QueueOverflowError` (queue
+  occupancy) instead of misusing `BackpressureError` (socket bytes).
+
+### Changed (breaking)
+
+- `ClientMessage` / `ClientRequest` are exported as INTERFACES with a `kind`
+  discriminant; the implementations are not exported (compile-level seal,
+  not just a runtime throw). Discriminate with `x.kind === 'request'`.
+- Requests have exactly ONE consumer: a second `on('request')` registration
+  throws (a request carries a single response obligation).
+- `close()` is replaced by `disconnect()` (reconnectable) and `shutdown()`
+  (terminal; later `connect()` is refused).
+- `RequestManager` no longer self-subscribes to transport close (one
+  listener leaked per reconnect); the owning session resets it.
+- `prepublishOnly` now also enforces the API snapshot and runs the Rust
+  interop E2E.
+
 ## 0.4.0-beta.0 — 2026-08-14
 
 Lifecycle hardening: six reviewer-reproduced generation/lifecycle faults,

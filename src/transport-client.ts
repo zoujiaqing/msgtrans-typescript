@@ -5,19 +5,16 @@ import {
   Packet,
   PacketType,
 } from './packet.js';
-import { BackpressureError, TransportError } from './errors.js';
+import { QueueOverflowError, TransportError } from './errors.js';
 import { CodecRegistry, type CompressionCodec, ZlibCodec } from './codec.js';
 import { InboundNormalizer } from './inbound-normalizer.js';
-
-/**
- * Module-private construction token: `ClientMessage`/`ClientRequest` are
- * created by the transport and NOWHERE else. A consumer-constructible
- * ClientRequest could respond with an arbitrary messageId — the forgeable
- * handle Rust 2.0 makes unrepresentable.
- */
-const INTERNAL = Symbol('msgtrans.internal');
 import type { EnqueuedInfo, Transport } from './transport.js';
 import { RequestManager } from './request-manager.js';
+import {
+  requireCount,
+  requireFiniteAtLeast,
+  requireNonNegativeFinite,
+} from './validate.js';
 import {
   WebSocketTransport,
   type TextFramePolicy,
@@ -60,18 +57,21 @@ export interface TransportClientOptions {
   limits?: Partial<DecodeLimits>;
   /**
    * Inbound normalization queue caps (packets queued behind an in-flight
-   * decompression). Overflow closes the connection: the browser cannot
-   * pause the socket, but it can refuse to buffer without limit.
+   * decompression; bytes counted as full frame size — header + ext +
+   * payload). Overflow closes the connection: the browser cannot pause the
+   * socket, but it can refuse to buffer without limit.
    * Defaults: 8192 frames / 64 MiB.
    */
   maxInboundQueueFrames?: number;
   maxInboundQueueBytes?: number;
   /**
-   * Outbound chain cap (sends queued behind an in-flight compression).
-   * Exceeding it rejects the send with `BackpressureError` — the
-   * connection stays healthy. Default 8192.
+   * Outbound chain caps (sends queued behind an in-flight compression), in
+   * operations AND captured payload bytes. Exceeding either rejects the
+   * send with `QueueOverflowError` — the connection stays healthy.
+   * Defaults: 8192 ops / 64 MiB.
    */
   maxOutboundQueue?: number;
+  maxOutboundQueueBytes?: number;
   /**
    * Additional compression codecs. `ZlibCodec` (native
    * Compression/DecompressionStream) is always registered; entries here can
@@ -79,17 +79,10 @@ export interface TransportClientOptions {
    */
   codecs?: readonly CompressionCodec[];
   /**
-   * Connect-time retry policy. Default: no retry (one attempt only).
-   *
-   * This is the language mapping of the Rust crate's `RetryConfig`. It
-   * covers the *initial* `connect()` failure path — DNS / WebSocket
-   * handshake / cold-start network blips — not auto-reconnect after a
-   * dropped connection, which is the consuming SDK's responsibility
-   * (`@privchat/sdk` runs its own `ReconnectOptions` state machine on
-   * top of this transport).
-   *
-   * Default 0 retries preserves the original single-attempt behavior.
-   * Opt in by passing `{ maxRetries: N, ... }`.
+   * Connect-time retry policy for a SINGLE `connect()` call. Default: no
+   * retry (one attempt). When running a `ReconnectManager` on top, leave
+   * this at its zero default — stacking both multiplies attempt counts and
+   * wait times; the manager is THE retry policy.
    */
   connectRetry?: ConnectRetryOptions;
 }
@@ -99,16 +92,9 @@ export interface TransportClientOptions {
  *
  *   - `maxRetries`: number of ADDITIONAL attempts after the first one
  *     fails. Total attempts = `maxRetries + 1`. Default 0 (no retry).
- *   - `initialDelayMs`: delay before the FIRST retry (i.e. after attempt #0
- *     fails, before attempt #1). Default 100.
+ *   - `initialDelayMs`: delay before the FIRST retry. Default 100.
  *   - `maxDelayMs`: cap applied after exponential growth. Default 10_000.
  *   - `multiplier`: per-attempt backoff multiplier. Default 2.
- *
- * Delay formula for attempt `n` (1-indexed retry): `min(maxDelayMs,
- * initialDelayMs * multiplier^(n - 1))`.
- *
- * Retry is unconditional — any `transport.connect()` rejection triggers
- * a retry until `maxRetries` is exhausted. The last error is rethrown.
  */
 export interface ConnectRetryOptions {
   maxRetries?: number;
@@ -119,59 +105,140 @@ export interface ConnectRetryOptions {
 
 type ClientEvent = 'message' | 'request' | 'messageEnqueued' | 'close' | 'error';
 
+/** A one-way message delivered to the application. Always plaintext: the
+ *  inbound normalizer has already undone any compression. */
+export interface ClientMessage {
+  readonly kind: 'message';
+  readonly payload: Uint8Array;
+  /** Alias for `payload`. */
+  readonly data: Uint8Array;
+  readonly bizType: number;
+  readonly messageId: number;
+  readonly extHeader: Uint8Array;
+}
+
+/**
+ * A request delivered to the client that carries the obligation to answer.
+ * An INTERFACE by design: the implementation is not exported, so no consumer
+ * can construct one and respond with an arbitrary messageId — the forgeable
+ * handle Rust 2.0 makes unrepresentable. `respond()` answers at most once,
+ * and only onto the connection session it arrived on.
+ */
+export interface ClientRequest {
+  readonly kind: 'request';
+  readonly payload: Uint8Array;
+  /** Alias for `payload`. */
+  readonly data: Uint8Array;
+  readonly bizType: number;
+  readonly messageId: number;
+  readonly extHeader: Uint8Array;
+  readonly hasResponded: boolean;
+  respond(payload: Uint8Array, options?: SendOptions): Promise<void>;
+}
+
+/**
+ * ONE connection's ownership unit — the internal mapping of Rust 2.0's
+ * session: the id allocator, request registry, inbound normalizer and
+ * outbound queue all belong to the session, and closing it voids every
+ * piece of in-flight async work at once. Nothing here is keyed on a
+ * generation NUMBER an adapter must advance by firing events: the object's
+ * own identity is the generation, so an adapter that never emits `close`
+ * still cannot leak old work into a replacement connection.
+ */
+class Session {
+  readonly manager: RequestManager;
+  readonly normalizer: InboundNormalizer;
+  outboundChain: Promise<void> = Promise.resolve();
+  outboundFrames = 0;
+  outboundBytes = 0;
+  closed = false;
+
+  constructor(
+    transport: Transport,
+    defaultTimeoutMs: number | undefined,
+    codecs: CodecRegistry,
+    limits: DecodeLimits,
+    inboundCaps: { maxFrames: number; maxBytes: number },
+  ) {
+    this.manager = new RequestManager(transport, { defaultTimeoutMs });
+    this.normalizer = new InboundNormalizer(codecs, limits, inboundCaps);
+  }
+}
+
 export class TransportClient {
   private readonly transport: Transport;
-  private readonly requestManager: RequestManager;
   private readonly limits: DecodeLimits;
   private readonly codecs: CodecRegistry;
-  private normalizer: InboundNormalizer;
+  private readonly defaultTimeoutMs: number | undefined;
   private readonly inboundCaps: { maxFrames: number; maxBytes: number };
   private readonly maxOutboundQueue: number;
+  private readonly maxOutboundQueueBytes: number;
   private readonly messageListeners: Array<(msg: ClientMessage) => void> = [];
-  private readonly requestListeners: Array<(req: ClientRequest) => void> = [];
+  private requestListener: ((req: ClientRequest) => void) | null = null;
   private readonly messageEnqueuedListeners: Array<(info: EnqueuedInfo) => void> =
     [];
   private readonly closeListeners: Array<(event?: unknown) => void> = [];
   private readonly errorListeners: Array<(error: unknown) => void> = [];
   private readonly retryOpts: Required<ConnectRetryOptions>;
-  /**
-   * Program-order guarantee for the outbound path. Compression is async, so
-   * without serialization `send(a, {compression}); send(b);` would put `b`
-   * on the wire first — the outbound mirror of the inbound reordering the
-   * normalizer chain prevents. Every outbound packet passes through this
-   * chain; a plain send behind a compressing one waits for it, exactly as
-   * Rust's inline `SendOptions::apply` on the send path.
-   */
-  private outboundChain: Promise<void> = Promise.resolve();
-  /** Outbound packets queued or in flight on the chain. */
-  private outboundDepth = 0;
-  /**
-   * Connection generation, bumped on every close. A `ClientRequest` captures
-   * the generation it arrived on; its `respond()` refuses to write onto a
-   * LATER connection — the client-side mapping of Rust 2.0's
-   * generation-bound respond claims.
-   */
-  private generation = 0;
+  /** The CURRENT connection's ownership unit. Replaced atomically on every
+   *  real (re)connect; everything async captures the session it started on
+   *  and is refused once that object is no longer current. */
+  private session: Session;
+  /** Single-flight guard: concurrent `connect()` calls share one attempt,
+   *  so two completion paths can never each install a session (the id-ABA
+   *  the seventh review reproduced). */
+  private connectFlight: Promise<void> | null = null;
+  private terminated = false;
 
   constructor(options: TransportClientOptions) {
     this.limits = normalizeDecodeLimits(options.limits);
     this.transport = resolveTransport(options);
-    this.requestManager = new RequestManager(this.transport, {
-      defaultTimeoutMs: options.defaultTimeoutMs,
-    });
+    this.defaultTimeoutMs =
+      options.defaultTimeoutMs === undefined
+        ? undefined
+        : requireNonNegativeFinite('defaultTimeoutMs', options.defaultTimeoutMs);
     this.codecs = new CodecRegistry([new ZlibCodec(), ...(options.codecs ?? [])]);
     this.inboundCaps = {
-      maxFrames: requireCap('maxInboundQueueFrames', options.maxInboundQueueFrames ?? 8192),
-      maxBytes: requireCap('maxInboundQueueBytes', options.maxInboundQueueBytes ?? 64 * 1024 * 1024),
+      maxFrames: requireCount(
+        'maxInboundQueueFrames',
+        options.maxInboundQueueFrames ?? 8192,
+      ),
+      maxBytes: requireCount(
+        'maxInboundQueueBytes',
+        options.maxInboundQueueBytes ?? 64 * 1024 * 1024,
+      ),
     };
-    this.maxOutboundQueue = requireCap('maxOutboundQueue', options.maxOutboundQueue ?? 8192);
-    this.normalizer = new InboundNormalizer(this.codecs, this.limits, this.inboundCaps);
+    this.maxOutboundQueue = requireCount(
+      'maxOutboundQueue',
+      options.maxOutboundQueue ?? 8192,
+    );
+    this.maxOutboundQueueBytes = requireCount(
+      'maxOutboundQueueBytes',
+      options.maxOutboundQueueBytes ?? 64 * 1024 * 1024,
+    );
+    const maxRetries = options.connectRetry?.maxRetries ?? 0;
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new TransportError(
+        `invalid connectRetry.maxRetries: ${maxRetries} (must be a non-negative integer)`,
+      );
+    }
     this.retryOpts = {
-      maxRetries: options.connectRetry?.maxRetries ?? 0,
-      initialDelayMs: options.connectRetry?.initialDelayMs ?? 100,
-      maxDelayMs: options.connectRetry?.maxDelayMs ?? 10_000,
-      multiplier: options.connectRetry?.multiplier ?? 2,
+      maxRetries,
+      initialDelayMs: requireNonNegativeFinite(
+        'connectRetry.initialDelayMs',
+        options.connectRetry?.initialDelayMs ?? 100,
+      ),
+      maxDelayMs: requireNonNegativeFinite(
+        'connectRetry.maxDelayMs',
+        options.connectRetry?.maxDelayMs ?? 10_000,
+      ),
+      multiplier: requireFiniteAtLeast(
+        'connectRetry.multiplier',
+        options.connectRetry?.multiplier ?? 2,
+        1,
+      ),
     };
+    this.session = this.newSession();
 
     this.transport.onMessage((p) => this.handleIncoming(p));
     this.transport.onMessageEnqueued((info) =>
@@ -184,29 +251,35 @@ export class TransportClient {
   /**
    * Open the transport with optional retry-on-failure.
    *
-   * Attempt 0 runs immediately. If it rejects and `connectRetry.maxRetries
-   * > 0`, the transport is `close()`d (defensively, to reset any
-   * mid-Connecting state that would otherwise cause subsequent
-   * `transport.connect()` calls to return the prior rejected promise),
-   * a backoff delay is applied, and another attempt is made — up to
-   * `maxRetries` additional times. The final attempt's rejection is
-   * thrown verbatim.
+   * Idempotent on a live connection, single-flight under concurrency: any
+   * number of overlapping `connect()` calls share ONE attempt and observe
+   * its outcome, and exactly one new session is installed per real
+   * (re)connection.
    */
-  async connect(): Promise<void> {
-    // IDEMPOTENT: a connect() on a live connection is a no-op. The old
-    // behavior restarted the id generation unconditionally, so a redundant
-    // connect while a request was pending handed the NEXT request the same
-    // id and stranded the first promise forever.
-    if (this.transport.isConnected()) return;
+  connect(): Promise<void> {
+    if (this.terminated) {
+      return Promise.reject(new TransportError('client is shut down'));
+    }
+    if (this.transport.isConnected() && !this.session.closed) {
+      return Promise.resolve();
+    }
+    if (this.connectFlight) return this.connectFlight;
+    const flight = this.doConnect().finally(() => {
+      if (this.connectFlight === flight) this.connectFlight = null;
+    });
+    this.connectFlight = flight;
+    return flight;
+  }
+
+  private async doConnect(): Promise<void> {
     const total = this.retryOpts.maxRetries + 1;
-    let lastError: unknown;
+    let lastError: unknown = new TransportError('connect failed');
     for (let attempt = 0; attempt < total; attempt++) {
       if (attempt > 0) {
         try {
           await this.transport.close();
         } catch {
-          // Ignore — we're about to retry; the next connect attempt
-          // will surface any real problem.
+          // Ignore — the next connect attempt will surface any real problem.
         }
         const delay = Math.min(
           this.retryOpts.maxDelayMs,
@@ -214,20 +287,15 @@ export class TransportClient {
             Math.pow(this.retryOpts.multiplier, attempt - 1),
         );
         await sleep(delay);
+        if (this.terminated) throw new TransportError('client is shut down');
       }
       try {
         await this.transport.connect();
-        // A fresh connection is a fresh generation: new id counter (Rust —
-        // a reconnect gets a fresh session with a fresh counter; safe, the
-        // close rejected every pending entry) and a NEW normalizer, so an
-        // old generation's in-flight decompression has nowhere to deliver
-        // and a poisoned stream does not leak into the replacement.
-        this.requestManager.startGeneration();
-        this.normalizer = new InboundNormalizer(
-          this.codecs,
-          this.limits,
-          this.inboundCaps,
-        );
+        // Exactly one session per real connection, installed by the single
+        // flight. The OLD session is closed first, which voids all of its
+        // still-running async work — no event from any adapter required.
+        this.retireSession(new TransportError('connection superseded'));
+        this.session = this.newSession();
         return;
       } catch (e) {
         lastError = e;
@@ -236,14 +304,24 @@ export class TransportClient {
     throw lastError;
   }
 
-  /** Close the underlying transport. Alias: `disconnect()`. */
-  close(): Promise<void> {
-    return this.transport.close();
+  /**
+   * End the current connection. Reconnecting afterwards is allowed —
+   * this is the "hang up" verb, not the "destroy the client" one.
+   */
+  async disconnect(): Promise<void> {
+    // Retire FIRST: even an adapter that never fires a close event cannot
+    // leave the old session's async work alive.
+    this.retireSession(new TransportError('disconnected'));
+    await this.transport.close();
   }
 
-  /** Alias for `close()` — matches Rust `TransportClient::disconnect()`. */
-  disconnect(): Promise<void> {
-    return this.transport.close();
+  /**
+   * Terminal shutdown: disconnects and refuses every future `connect()`.
+   * Use `disconnect()` for a connection you intend to re-establish.
+   */
+  async shutdown(): Promise<void> {
+    this.terminated = true;
+    await this.disconnect();
   }
 
   isConnected(): boolean {
@@ -254,23 +332,27 @@ export class TransportClient {
    * One-way send. Resolves when the packet was ACCEPTED by the socket's
    * outbound buffer (enqueue-confirmed — a browser WebSocket offers no
    * write confirmation, and this API does not pretend otherwise).
+   *
+   * SESSION-BOUND: the send belongs to the connection that was current when
+   * it was CALLED. If the connection turns over while (async) compression
+   * runs, the send is refused — completing it would silently replay a
+   * request the application never chose to retry.
    */
   send(payload: Uint8Array, options: SendOptions = {}): Promise<void> {
-    // Fast path: no codec work and nothing queued — the enqueue is invoked
-    // SYNCHRONOUSLY, exactly like the pre-0.2 client. Anything in flight
-    // forces the chain, so a plain send can never overtake a compressing one.
-    if (this.canBypassChain(options)) {
-      return this.requestManager.send(
+    const session = this.session;
+    if (this.canBypassChain(session, options)) {
+      return session.manager.send(
         this.buildPlain(PacketType.OneWay, payload, options),
       );
     }
-    return this.scheduleOutbound(async () => {
+    return this.scheduleOutbound(session, payload.length, async () => {
       const packet = await this.buildOutbound(
         PacketType.OneWay,
         payload,
         options,
       );
-      await this.requestManager.send(packet);
+      this.requireCurrent(session);
+      await session.manager.send(packet);
     });
   }
 
@@ -278,67 +360,35 @@ export class TransportClient {
     payload: Uint8Array,
     options: RequestOptions = {},
   ): Promise<Uint8Array> {
-    if (this.canBypassChain(options)) {
+    if (options.timeoutMs !== undefined) {
+      requireNonNegativeFinite('timeoutMs', options.timeoutMs);
+    }
+    const session = this.session;
+    if (this.canBypassChain(session, options)) {
       const packet = this.buildPlain(PacketType.Request, payload, options);
-      const response = await this.requestManager.request(packet, {
+      const response = await session.manager.request(packet, {
         timeoutMs: options.timeoutMs,
       });
       return response.payload;
     }
-    const { response } = await this.scheduleOutbound(async () => {
-      const packet = await this.buildOutbound(
-        PacketType.Request,
-        payload,
-        options,
-      );
-      // Hand the packet to the manager INSIDE the chain (so enqueue order is
-      // program order) but do not await the response here — that would
-      // serialize whole round-trips, not just enqueues. The holder object
-      // keeps the promise from being flattened by the async return.
-      return {
-        response: this.requestManager.request(packet, {
-          timeoutMs: options.timeoutMs,
-        }),
-      };
-    });
-    return (await response).payload;
-  }
-
-  /** Respond path, reachable only through the closure handed to
-   *  `ClientRequest` at construction. */
-  private respondTo(
-    request: ClientRequest,
-    payload: Uint8Array,
-    options: SendOptions,
-  ): Promise<void> {
-    if (this.canBypassChain(options)) {
-      // Generation already verified by the caller (`ClientRequest.respond`)
-      // and nothing async happens between here and the enqueue.
-      return this.requestManager.sendResponse(
-        this.buildPlain(PacketType.Response, payload, {
-          ...options,
-          bizType: options.bizType ?? request.bizType,
-        }, request.messageId),
-      );
-    }
-    return this.scheduleOutbound(async () => {
-      const packet = await this.buildOutbound(
-        PacketType.Response,
-        payload,
-        { ...options, bizType: options.bizType ?? request.bizType },
-        request.messageId,
-      );
-      // Generation re-check AFTER the (async) compression: the connection
-      // may have turned over while the codec ran, and a response built for
-      // generation N must never be written onto generation N+1 — on the
-      // server it could complete a DIFFERENT request that drew the same id.
-      if (!request.stillCurrent()) {
-        throw new TransportError(
-          'connection generation changed; response not sent',
+    const { response } = await this.scheduleOutbound(
+      session,
+      payload.length,
+      async () => {
+        const packet = await this.buildOutbound(
+          PacketType.Request,
+          payload,
+          options,
         );
-      }
-      await this.requestManager.sendResponse(packet);
-    });
+        this.requireCurrent(session);
+        return {
+          response: session.manager.request(packet, {
+            timeoutMs: options.timeoutMs,
+          }),
+        };
+      },
+    );
+    return (await response).payload;
   }
 
   on(event: 'message', cb: (msg: ClientMessage) => void): () => void;
@@ -361,9 +411,20 @@ export class TransportClient {
       return () => removeFrom(this.messageListeners, fn);
     }
     if (event === 'request') {
+      // ONE consumer: a request carries a single response obligation, and
+      // fanning it out to several handlers splits that responsibility —
+      // whoever answers second discovers it at runtime. Rust 2.0's single
+      // SessionHandler is the same rule.
+      if (this.requestListener) {
+        throw new TransportError(
+          'a request consumer is already registered; requests have exactly one',
+        );
+      }
       const fn = cb as (req: ClientRequest) => void;
-      this.requestListeners.push(fn);
-      return () => removeFrom(this.requestListeners, fn);
+      this.requestListener = fn;
+      return () => {
+        if (this.requestListener === fn) this.requestListener = null;
+      };
     }
     if (event === 'messageEnqueued') {
       const fn = cb as (info: EnqueuedInfo) => void;
@@ -380,39 +441,57 @@ export class TransportClient {
     return () => removeFrom(this.errorListeners, fn);
   }
 
+  // ----- session plumbing -----
+
+  private newSession(): Session {
+    return new Session(
+      this.transport,
+      this.defaultTimeoutMs,
+      this.codecs,
+      this.limits,
+      this.inboundCaps,
+    );
+  }
+
+  private retireSession(reason: TransportError): void {
+    const old = this.session;
+    if (old.closed) return;
+    old.closed = true;
+    old.manager.reset(reason);
+  }
+
+  private requireCurrent(session: Session): void {
+    if (session !== this.session || session.closed) {
+      throw new TransportError('connection changed; not sent');
+    }
+  }
+
   private handleIncoming(packet: Packet): void {
-    // ALL inbound traffic passes through the serial normalizer: compressed
-    // bodies are decompressed exactly once, delivery order is arrival order,
-    // and a packet that cannot be normalized closes the connection instead
-    // of reaching the application as compressed bytes.
-    //
-    // GENERATION-BOUND: both callbacks are valid only for the generation the
-    // packet ARRIVED on. Reconnecting replaces the normalizer, and anything
-    // still in flight on the old one delivers into these guards — which
-    // refuse it. An old connection's bytes never surface as the new one's.
-    const generation = this.generation;
-    this.normalizer.push(
+    // ALL inbound traffic passes through the SESSION's normalizer:
+    // compressed bodies are decompressed exactly once, delivery order is
+    // arrival order, and everything is bound to the session the packet
+    // arrived on — a reconnect installs a fresh session, so old in-flight
+    // work has nowhere to deliver, with or without an adapter close event.
+    const session = this.session;
+    if (session.closed) return;
+    session.normalizer.push(
       packet,
       (p) => {
-        if (this.generation !== generation) return;
-        this.route(p);
+        if (session !== this.session || session.closed) return;
+        this.route(session, p);
       },
       (e) => {
-        if (this.generation !== generation) return;
+        if (session !== this.session || session.closed) return;
         this.dispatchError(e);
         void this.transport.close();
       },
     );
   }
 
-  private route(packet: Packet): void {
-    if (this.requestManager.handleIncoming(packet)) return;
+  private route(session: Session, packet: Packet): void {
+    if (session.manager.handleIncoming(packet)) return;
     if (packet.packetType === PacketType.Response) {
-      // Orphan Response: a Response whose messageId matches no pending
-      // request (timed out, reset on reconnect, or a misbehaving server).
-      // Do NOT surface it as a normal message — apps would mistake it for
-      // server-pushed data. Drop it and report via the error channel so it
-      // stays observable in logs.
+      // Orphan Response: dropped + reported, never surfaced as data.
       this.dispatchError(
         new TransportError(
           `dropped orphan Response (messageId=${packet.messageId}, ` +
@@ -422,22 +501,19 @@ export class TransportClient {
       return;
     }
     if (packet.packetType === PacketType.Request) {
-      const generation = this.generation;
-      const req = new ClientRequest(INTERNAL, packet, {
-        isCurrent: () => this.generation === generation,
-        respond: (request, payload, options) =>
-          this.respondTo(request, payload, options),
-      });
-      for (const cb of this.requestListeners) {
-        try {
-          cb(req);
-        } catch (e) {
-          this.dispatchError(e);
-        }
+      const listener = this.requestListener;
+      if (!listener) return; // no consumer: the peer's own timeout applies
+      const req = new ClientRequestImpl(packet, (request, payload, options) =>
+        this.respondTo(session, request, payload, options),
+      );
+      try {
+        listener(req);
+      } catch (e) {
+        this.dispatchError(e);
       }
       return;
     }
-    const msg = new ClientMessage(INTERNAL, packet);
+    const msg = new ClientMessageImpl(packet);
     for (const cb of this.messageListeners) {
       try {
         cb(msg);
@@ -445,6 +521,38 @@ export class TransportClient {
         this.dispatchError(e);
       }
     }
+  }
+
+  private respondTo(
+    session: Session,
+    request: ClientRequestImpl,
+    payload: Uint8Array,
+    options: SendOptions,
+  ): Promise<void> {
+    const merged = { ...options, bizType: options.bizType ?? request.bizType };
+    if (this.canBypassChain(session, merged)) {
+      try {
+        this.requireCurrent(session);
+      } catch (e) {
+        return Promise.reject(e);
+      }
+      return session.manager.sendResponse(
+        this.buildPlain(PacketType.Response, payload, merged, request.messageId),
+      );
+    }
+    return this.scheduleOutbound(session, payload.length, async () => {
+      const packet = await this.buildOutbound(
+        PacketType.Response,
+        payload,
+        merged,
+        request.messageId,
+      );
+      // Session re-check AFTER the (async) compression: a response built
+      // for one connection must never be written onto its replacement — on
+      // the server it could complete a DIFFERENT request with the same id.
+      this.requireCurrent(session);
+      await session.manager.sendResponse(packet);
+    });
   }
 
   private async buildOutbound(
@@ -457,8 +565,6 @@ export class TransportClient {
     let body = payload;
     let compression: CompressionType = CompressionType.None;
     if (requested !== CompressionType.None) {
-      // `require` throws when no codec is registered: the send fails
-      // instead of shipping a raw payload under a compressed header.
       const codec = this.codecs.require(requested);
       body = await codec.compress(payload, this.limits.maxPayloadLen);
       compression = requested;
@@ -474,10 +580,16 @@ export class TransportClient {
   }
 
   /** Sync bypass is safe only when there is no codec work AND nothing is
-   *  queued on the chain (otherwise this packet would overtake it). */
-  private canBypassChain(options: SendOptions): boolean {
+   *  queued on the session's chain (otherwise this packet would overtake
+   *  it) AND the session is still current. */
+  private canBypassChain(session: Session, options: SendOptions): boolean {
     const requested = options.compression ?? CompressionType.None;
-    return requested === CompressionType.None && this.outboundDepth === 0;
+    return (
+      requested === CompressionType.None &&
+      session.outboundFrames === 0 &&
+      session === this.session &&
+      !session.closed
+    );
   }
 
   /** Synchronous packet construction for the no-compression path. */
@@ -497,23 +609,37 @@ export class TransportClient {
     });
   }
 
-  private scheduleOutbound<T>(op: () => Promise<T>): Promise<T> {
-    if (this.outboundDepth >= this.maxOutboundQueue) {
-      // BOUNDED: a stalled compression cannot let sends pile up without
-      // limit. The connection stays healthy; the caller backs off.
+  private scheduleOutbound<T>(
+    session: Session,
+    payloadBytes: number,
+    op: () => Promise<T>,
+  ): Promise<T> {
+    if (
+      session.outboundFrames >= this.maxOutboundQueue ||
+      session.outboundBytes + payloadBytes > this.maxOutboundQueueBytes
+    ) {
+      // BOUNDED in ops AND bytes: a stalled compression cannot let sends —
+      // or their captured payloads — pile up without limit. The connection
+      // stays healthy; the caller backs off.
       return Promise.reject(
-        new BackpressureError(this.outboundDepth, this.maxOutboundQueue),
+        new QueueOverflowError(
+          'outbound',
+          session.outboundFrames,
+          session.outboundBytes,
+        ),
       );
     }
-    this.outboundDepth += 1;
-    const result = this.outboundChain.then(async () => {
+    session.outboundFrames += 1;
+    session.outboundBytes += payloadBytes;
+    const result = session.outboundChain.then(async () => {
       try {
         return await op();
       } finally {
-        this.outboundDepth -= 1;
+        session.outboundFrames -= 1;
+        session.outboundBytes -= payloadBytes;
       }
     });
-    this.outboundChain = result.then(
+    session.outboundChain = result.then(
       () => undefined,
       () => undefined,
     );
@@ -531,7 +657,7 @@ export class TransportClient {
   }
 
   private dispatchClose(ev?: unknown): void {
-    this.generation += 1;
+    this.retireSession(new TransportError('transport closed'));
     for (const cb of this.closeListeners) {
       try {
         cb(ev);
@@ -552,25 +678,14 @@ export class TransportClient {
   }
 }
 
-/** A one-way message delivered to the application. Always plaintext: the
- *  inbound normalizer has already undone any compression. */
-export class ClientMessage {
-  private readonly packet: Packet;
+// ----- internal handle implementations (NOT exported) -----
 
-  /** @internal — constructed by the transport only. */
-  constructor(token: unknown, packet: Packet) {
-    if (token !== INTERNAL) {
-      throw new TransportError(
-        'ClientMessage is created by the transport, not by consumers',
-      );
-    }
-    this.packet = packet;
-  }
-
+class ClientMessageImpl implements ClientMessage {
+  readonly kind = 'message' as const;
+  constructor(private readonly packet: Packet) {}
   get payload(): Uint8Array {
     return this.packet.payload;
   }
-  /** Alias for `payload`. */
   get data(): Uint8Array {
     return this.packet.payload;
   }
@@ -585,50 +700,22 @@ export class ClientMessage {
   }
 }
 
-/**
- * A request delivered to the client that carries the obligation to answer —
- * the TS mapping of Rust 2.0's `ClientRequest`. `respond()` answers it at
- * most once (runtime-enforced; TS cannot consume ownership at the type
- * level), and only onto the connection generation it arrived on: a stale
- * response written after a reconnect could complete a DIFFERENT server-side
- * request that drew the same id.
- */
-interface RespondPath {
-  isCurrent: () => boolean;
-  respond: (
-    request: ClientRequest,
-    payload: Uint8Array,
-    options: SendOptions,
-  ) => Promise<void>;
-}
-
-export class ClientRequest {
+class ClientRequestImpl implements ClientRequest {
+  readonly kind = 'request' as const;
   private respondedFlag = false;
-  private readonly packet: Packet;
-  private readonly path: RespondPath;
 
-  /** @internal — constructed by the transport only. An externally
-   *  constructible ClientRequest could respond with an arbitrary messageId,
-   *  which is exactly the forgeable handle this type exists to prevent. */
-  constructor(token: unknown, packet: Packet, path: RespondPath) {
-    if (token !== INTERNAL) {
-      throw new TransportError(
-        'ClientRequest is created by the transport, not by consumers',
-      );
-    }
-    this.packet = packet;
-    this.path = path;
-  }
-
-  /** @internal */
-  stillCurrent(): boolean {
-    return this.path.isCurrent();
-  }
+  constructor(
+    private readonly packet: Packet,
+    private readonly respondPath: (
+      request: ClientRequestImpl,
+      payload: Uint8Array,
+      options: SendOptions,
+    ) => Promise<void>,
+  ) {}
 
   get payload(): Uint8Array {
     return this.packet.payload;
   }
-  /** Alias for `payload`. */
   get data(): Uint8Array {
     return this.packet.payload;
   }
@@ -653,23 +740,9 @@ export class ClientRequest {
         ),
       );
     }
-    if (!this.path.isCurrent()) {
-      return Promise.reject(
-        new TransportError(
-          'connection generation changed; response not sent',
-        ),
-      );
-    }
     this.respondedFlag = true;
-    return this.path.respond(this, payload, options);
+    return this.respondPath(this, payload, options);
   }
-}
-
-function requireCap(field: string, value: number): number {
-  if (!Number.isFinite(value) || value < 1) {
-    throw new TransportError(`invalid ${field}: ${value} (must be >= 1)`);
-  }
-  return Math.floor(value);
 }
 
 function resolveTransport(options: TransportClientOptions): Transport {
