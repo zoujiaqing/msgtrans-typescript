@@ -61,16 +61,36 @@ export const DEFAULT_DECODE_LIMITS: DecodeLimits = {
   maxExtHeaderLen: DEFAULT_MAX_EXT_HEADER_LEN,
 };
 
-/** Clamp caller-supplied limits into what the wire format can express. */
+/**
+ * Validate caller-supplied limits and clamp them into what the wire format
+ * can express. VALIDATE, not coerce: `NaN` makes every `>` comparison false,
+ * which silently disables the decompression-bomb defense — an invalid limit
+ * is a thrown error, never a quietly-open door.
+ */
 export function normalizeDecodeLimits(
   limits?: Partial<DecodeLimits>,
 ): DecodeLimits {
-  const payload = limits?.maxPayloadLen ?? DEFAULT_MAX_PAYLOAD_LEN;
-  const ext = limits?.maxExtHeaderLen ?? DEFAULT_MAX_EXT_HEADER_LEN;
+  const payload = requireNonNegativeInt(
+    'maxPayloadLen',
+    limits?.maxPayloadLen ?? DEFAULT_MAX_PAYLOAD_LEN,
+  );
+  const ext = requireNonNegativeInt(
+    'maxExtHeaderLen',
+    limits?.maxExtHeaderLen ?? DEFAULT_MAX_EXT_HEADER_LEN,
+  );
   return {
-    maxPayloadLen: Math.min(Math.max(payload, 0), WIRE_MAX_PAYLOAD_LEN),
-    maxExtHeaderLen: Math.min(Math.max(ext, 0), WIRE_MAX_EXT_HEADER_LEN),
+    maxPayloadLen: Math.min(payload, WIRE_MAX_PAYLOAD_LEN),
+    maxExtHeaderLen: Math.min(ext, WIRE_MAX_EXT_HEADER_LEN),
   };
+}
+
+function requireNonNegativeInt(field: string, value: number): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new WireFormatError(
+      `invalid ${field}: ${value} (must be a finite non-negative number)`,
+    );
+  }
+  return Math.floor(value);
 }
 
 const EMPTY: Uint8Array = new Uint8Array(0);

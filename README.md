@@ -4,13 +4,13 @@ TypeScript client runtime for the [msgtrans](https://github.com/zoujiaqing/msgtr
 
 `@msgtrans/client` is the language mapping of the `msgtrans` Rust client surface — same Packet semantics, same Request/Response correlation rules, same wire bytes. The wire format is defined by [`WIRE_FORMAT.md`](https://github.com/zoujiaqing/msgtrans/blob/main/docs/WIRE_FORMAT.md) and conformance is verified by a shared cross-language fixture suite.
 
-> **Status: 0.2.0-beta.0** — the msgtrans **2.0 semantic alignment**: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
+> **Status: 0.4.0-beta.0** — 2.0 semantic alignment + lifecycle hardening: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
 >
 > **Compatibility matrix**
 >
 > | @msgtrans/client | msgtrans (Rust) | Wire protocol |
 > |---|---|---|
-> | 0.2.x | 2.0.x | v1 |
+> | 0.2.x – 0.4.x | 2.0.x | v1 |
 > | 0.1.x | 1.0.x / 2.0.x | v1 |
 >
 > The version numbers deliberately do NOT lock step with the Rust crate: this is a browser, single-connection client, not a full mapping of the Rust server architecture. What IS aligned: the wire format, the request lifecycle, strict decoding, and the error semantics.
@@ -208,7 +208,8 @@ WebTransport will land as a separate `Transport` implementation; the existing `T
 
 - [x] **0.1.0-beta** — wire format, WebSocket transport, request/response, server-push handling
 - [x] **0.2.0-beta** — 2.0 semantic alignment: strict decode + `DecodeLimits`, transport-owned ids (no wrap), socket & respond generations, serialized inbound normalization, zlib via native streams, codec SPI (zstd injectable), honest enqueue tier, projected backpressure, API surface shrink
-- [x] **0.3.0-beta** — `HeartbeatMonitor` (caller-supplied probe, idle-based), `ReconnectManager` (backoff, blunt stop-first contract), `WebTransportTransport` (HTTP/3, Rust-QUIC-mirror framing, generation-isolated)
+- [x] **0.3.0-beta** — `HeartbeatMonitor` (caller-supplied probe, idle-based), `ReconnectManager` (backoff + jitter, blunt stop-first contract), `WebTransportTransport`
+- [x] **0.4.0-beta** — lifecycle hardening: idempotent `connect()`, generation-bound + poisoned + bounded inbound normalization, cancel-safe connect/close, sealed `ClientMessage`/`ClientRequest` handles, strict config validation. **WebTransport moved to `@msgtrans/client/experimental`** until a real server interop E2E exists.
 - [ ] later — Zstd codec package, WebTransport server interop E2E (needs a server endpoint)
 
 ## License

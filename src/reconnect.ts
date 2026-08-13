@@ -1,4 +1,9 @@
 import type { TransportClient } from './transport-client.js';
+import {
+  requireAtLeast,
+  requireNonNegativeFinite,
+  requireRatio,
+} from './validate.js';
 
 export type ReconnectPhase = 'reconnecting' | 'connected' | 'gave-up';
 
@@ -11,6 +16,13 @@ export interface ReconnectOptions {
   multiplier?: number;
   /** Give up after this many consecutive failures. Default Infinity. */
   maxAttempts?: number;
+  /**
+   * Backoff jitter, 0..1. Each delay is multiplied by
+   * `1 - jitterRatio * random()`, spreading a fleet's reconnects instead of
+   * synchronizing a thundering herd on the same schedule. Default 0.2;
+   * 0 disables (deterministic delays, e.g. for tests).
+   */
+  jitterRatio?: number;
   /** Observability hook; `attempt` is 1-based within the current outage. */
   onStateChange?: (phase: ReconnectPhase, attempt: number) => void;
 }
@@ -31,10 +43,15 @@ export interface ReconnectOptions {
  *   close (pending state rides the connection); replay policy belongs to
  *   the application layer, which knows what is idempotent.
  * - `stop()` during a backoff sleep abandons the cycle at the next wake.
+ * - This is THE retry policy. `TransportClientOptions.connectRetry` defaults
+ *   to zero retries; leave it there when using this manager — stacking both
+ *   multiplies attempt counts and wait times.
  */
 export class ReconnectManager {
   private readonly client: TransportClient;
   private readonly opts: Required<Omit<ReconnectOptions, 'onStateChange'>>;
+  /** A close observed while a cycle was running: re-examined when it ends. */
+  private pendingRerun = false;
   private readonly onStateChange: (phase: ReconnectPhase, attempt: number) => void;
 
   private active = false;
@@ -44,10 +61,17 @@ export class ReconnectManager {
   constructor(client: TransportClient, options: ReconnectOptions = {}) {
     this.client = client;
     this.opts = {
-      initialDelayMs: options.initialDelayMs ?? 1_000,
-      maxDelayMs: options.maxDelayMs ?? 30_000,
-      multiplier: options.multiplier ?? 2,
-      maxAttempts: options.maxAttempts ?? Infinity,
+      initialDelayMs: requireNonNegativeFinite(
+        'initialDelayMs',
+        options.initialDelayMs ?? 1_000,
+      ),
+      maxDelayMs: requireNonNegativeFinite(
+        'maxDelayMs',
+        options.maxDelayMs ?? 30_000,
+      ),
+      multiplier: requireAtLeast('multiplier', options.multiplier ?? 2, 1),
+      maxAttempts: requireAtLeast('maxAttempts', options.maxAttempts ?? Infinity, 1),
+      jitterRatio: requireRatio('jitterRatio', options.jitterRatio ?? 0.2),
     };
     this.onStateChange = options.onStateChange ?? (() => {});
   }
@@ -73,13 +97,20 @@ export class ReconnectManager {
   }
 
   private async runCycle(): Promise<void> {
-    if (!this.active || this.cycleRunning) return;
+    if (!this.active) return;
+    if (this.cycleRunning) {
+      // A close landing while a cycle unwinds is NOT swallowed: it is
+      // re-examined the moment the cycle ends. The old behavior dropped it,
+      // reported `connected`, and left the client down forever.
+      this.pendingRerun = true;
+      return;
+    }
     this.cycleRunning = true;
     try {
       let delay = this.opts.initialDelayMs;
       for (let attempt = 1; attempt <= this.opts.maxAttempts; attempt++) {
         this.onStateChange('reconnecting', attempt);
-        await sleep(delay);
+        await sleep(this.jittered(delay));
         if (!this.active) return; // stopped during backoff
         try {
           await this.client.connect();
@@ -93,7 +124,17 @@ export class ReconnectManager {
       this.stop();
     } finally {
       this.cycleRunning = false;
+      if (this.pendingRerun) {
+        this.pendingRerun = false;
+        if (this.active && !this.client.isConnected()) {
+          void this.runCycle();
+        }
+      }
     }
+  }
+
+  private jittered(delay: number): number {
+    return delay * (1 - this.opts.jitterRatio * Math.random());
   }
 }
 

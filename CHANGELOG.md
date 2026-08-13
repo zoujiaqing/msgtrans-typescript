@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.4.0-beta.0 — 2026-08-14
+
+Lifecycle hardening: six reviewer-reproduced generation/lifecycle faults,
+each captured as a failing test first, then fixed and re-falsified.
+
+### Fixed
+
+- **P0** `connect()` is idempotent: a redundant call on a live connection no
+  longer restarts the id space (which stranded a pending request's promise
+  by handing its id to the next request).
+- **P0** Inbound normalization is generation-bound: a reconnect installs a
+  fresh normalizer, so a previous connection's in-flight decompression has
+  nowhere to deliver. A fatal normalization failure POISONS the stream —
+  packets queued behind the violation are dropped, not delivered.
+- **P0** Cancel-safe lifecycle: WS `close()` during Connecting settles the
+  pending `connect()` (it used to hang forever on a hung handshake); a WT
+  factory that throws synchronously no longer wedges the state machine in
+  Connecting; WT `close()` during `connect()` fails that connect instead of
+  letting it report success on a dead connection.
+- **P1** Stale async results are void: `HeartbeatMonitor.stop()` bumps an
+  epoch so an in-flight probe's late verdict cannot close the next
+  connection; a close landing while a reconnect cycle unwinds is re-examined
+  when the cycle ends instead of being swallowed.
+- **P1** Bounded queues: inbound normalization (frames + bytes, overflow
+  closes) and the outbound compression chain (overflow rejects with
+  `BackpressureError`).
+- **P1** Strict config validation: `NaN`/negative/non-finite values in
+  `DecodeLimits`, retry, heartbeat and reconnect options THROW instead of
+  silently disarming comparisons (a `NaN` payload cap disabled the
+  decompression-bomb defense entirely).
+
+### Changed (breaking)
+
+- `ClientMessage` / `ClientRequest` are sealed: constructed by the transport
+  only (a consumer-constructible ClientRequest could respond with an
+  arbitrary messageId). `TransportClient.currentGeneration` and `respondTo`
+  are no longer public.
+- **WebTransport moved to `@msgtrans/client/experimental`** until a real
+  Rust WebTransport server exists for interop E2E.
+- `ReconnectOptions.jitterRatio` (default 0.2) spreads fleet reconnects;
+  `ReconnectManager` documents itself as THE retry policy (leave
+  `connectRetry` at its zero default underneath it).
+- `api-report.txt` now includes only modules reachable from the package
+  exports — the old all-of-dist concatenation froze internals.
+
 ## 0.3.0-beta.0 — 2026-08-13
 
 ### Added

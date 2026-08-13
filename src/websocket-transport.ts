@@ -253,13 +253,23 @@ export class WebSocketTransport implements Transport {
     if (this._state === TransportState.Closing) {
       return Promise.resolve();
     }
+    const wasConnecting = this._state === TransportState.Connecting;
     this._state = TransportState.Closing;
     try {
       this.ws?.close();
     } catch {
-      // The transition to Closed will still happen via onclose, or
-      // if the WS never fires onclose, we leave it in Closing — caller
-      // can read state to detect.
+      /* the deterministic close below still runs */
+    }
+    if (wasConnecting) {
+      // CANCEL SAFETY: a close during the handshake must settle the pending
+      // connect() — a hung handshake may never fire onclose, and the old
+      // behavior left that promise pending FOREVER (the state had already
+      // left Connecting, so the eventual onclose no longer rejected it).
+      const reject = this.connectReject;
+      this.connectResolve = null;
+      this.connectReject = null;
+      reject?.(new TransportError('connection closed during connect'));
+      this.handleClose({ reason: 'closed during connect' });
     }
     return Promise.resolve();
   }

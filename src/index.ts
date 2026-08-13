@@ -22,15 +22,6 @@ export type {
   TextFramePolicy,
 } from './websocket-transport.js';
 
-export {
-  WebTransportTransport,
-} from './webtransport-transport.js';
-export type {
-  WebTransportLike,
-  WebTransportFactory,
-  WebTransportTransportOptions,
-} from './webtransport-transport.js';
-
 export { HeartbeatMonitor } from './heartbeat.js';
 export type { HeartbeatOptions } from './heartbeat.js';
 

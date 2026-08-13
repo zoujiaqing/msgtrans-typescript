@@ -1,4 +1,5 @@
 import type { TransportClient } from './transport-client.js';
+import { requirePositiveFinite } from './validate.js';
 
 /**
  * Application-layer heartbeat.
@@ -47,11 +48,24 @@ export class HeartbeatMonitor {
   private probing = false;
   private readonly unsubscribes: Array<() => void> = [];
 
+  /**
+   * Bumped by every stop(): an in-flight probe belongs to the epoch it was
+   * launched in, and a verdict from a dead epoch is VOID — the old behavior
+   * let a stale probe failure close whatever connection came next.
+   */
+  private epoch = 0;
+
   constructor(client: TransportClient, options: HeartbeatOptions) {
     this.client = client;
     this.probe = options.probe;
-    this.intervalMs = options.intervalMs ?? 30_000;
-    this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.intervalMs = requirePositiveFinite(
+      'intervalMs',
+      options.intervalMs ?? 30_000,
+    );
+    this.timeoutMs = requirePositiveFinite(
+      'timeoutMs',
+      options.timeoutMs ?? 10_000,
+    );
     this.onDead =
       options.onDead ??
       (() => {
@@ -85,6 +99,7 @@ export class HeartbeatMonitor {
   }
 
   stop(): void {
+    this.epoch += 1;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -104,10 +119,12 @@ export class HeartbeatMonitor {
     if (Date.now() - this.lastActivity < this.intervalMs) return;
 
     this.probing = true;
+    const epoch = this.epoch;
     try {
       await withDeadline(this.probe(), this.timeoutMs);
       this.lastActivity = Date.now();
     } catch (e) {
+      if (epoch !== this.epoch) return; // stale verdict: stop() ran meanwhile
       this.stop();
       this.onDead(e);
     } finally {

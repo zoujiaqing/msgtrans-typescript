@@ -1,7 +1,7 @@
 {
   "name": "@msgtrans/client",
-  "version": "0.3.0-beta.0",
-  "description": "TypeScript client runtime for the msgtrans wire protocol \u2014 language mapping of the Rust crate, browser-first, WebSocket transport.",
+  "version": "0.4.0-beta.0",
+  "description": "TypeScript client runtime for the msgtrans wire protocol \u2014 browser-first; WebSocket transport, zlib compression, heartbeat/reconnect helpers, experimental WebTransport.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./experimental": {
+      "types": "./dist/experimental.d.ts",
+      "import": "./dist/experimental.js"
     }
   },
   "files": [
@@ -62,5 +66,12 @@
     "tag": "beta",
     "registry": "https://registry.npmjs.org"
   },
-  "sideEffects": false
+  "sideEffects": false,
+  "typesVersions": {
+    "*": {
+      "experimental": [
+        "./dist/experimental.d.ts"
+      ]
+    }
+  }
 }

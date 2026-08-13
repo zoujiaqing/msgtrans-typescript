@@ -98,13 +98,19 @@ export class WebTransportTransport implements Transport {
 
     const factory =
       this.opts.webTransportFactory ?? defaultWebTransportFactory;
-    let session: WebTransportLike;
+    // CANCEL SAFETY: `session` starts null so a factory that throws
+    // synchronously still lands in a catch that resets the state machine —
+    // the old shape left `session` unassigned and the state wedged in
+    // Connecting, refusing every retry.
+    let session: WebTransportLike | null = null;
     try {
       session = factory(this.opts.url);
       this.session = session;
       await session.ready;
       const stream = await session.createBidirectionalStream();
-      // Guard against a turnover during the awaits above.
+      // A close() during the awaits nulls `this.session`; a competing
+      // connect replaces it. Either way THIS attempt must fail, not
+      // report success on a connection that is already gone.
       if (this.session !== session) {
         throw new TransportError('connection superseded during connect');
       }
@@ -128,7 +134,7 @@ export class WebTransportTransport implements Transport {
         },
       );
     } catch (e) {
-      if (this.session === session!) {
+      if (session === null || this.session === session) {
         this._state = TransportState.Closed;
         this.session = null;
         this.writer = null;
@@ -174,10 +180,15 @@ export class WebTransportTransport implements Transport {
       return;
     }
     this._state = TransportState.Closing;
+    // Detach BEFORE closing: an in-flight connect() sees `this.session`
+    // change and fails its supersession check instead of opening a
+    // connection the caller just closed.
+    const session = this.session;
+    this.session = null;
     try {
-      this.session?.close();
+      session?.close();
     } catch {
-      /* closed promise still resolves */
+      /* the deterministic close below still runs */
     }
     // The definitive Closed transition arrives via the `closed` promise
     // handler (or has already run); force it if the platform never settles.

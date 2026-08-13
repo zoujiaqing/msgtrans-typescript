@@ -8,10 +8,12 @@ import {
   PacketType,
   ReservedFlag,
   TransportClient,
-  WebTransportTransport,
-  type WebTransportLike,
   WireFormatError,
 } from '../src/index.js';
+import {
+  WebTransportTransport,
+  type WebTransportLike,
+} from '../src/experimental.js';
 import { until } from './fake-transport.js';
 
 const text = (s: string) => new TextEncoder().encode(s);
@@ -80,7 +82,7 @@ describe('WebTransportTransport — framing', () => {
     const session = new FakeSession();
     const transport = await openTransport(session);
     const received: Packet[] = [];
-    transport.onMessage((p) => received.push(p));
+    transport.onMessage((p: Packet) => received.push(p));
 
     // Do NOT await the send before reading: the writer promise is REAL
     // backpressure (TransformStream readable HWM=0 pulls on read), so
@@ -104,7 +106,7 @@ describe('WebTransportTransport — framing', () => {
     const session = new FakeSession();
     const transport = await openTransport(session);
     const received: Packet[] = [];
-    transport.onMessage((p) => received.push(p));
+    transport.onMessage((p: Packet) => received.push(p));
 
     const whole = frame(Packet.oneWay(1, text('split into pieces')));
     // Split INSIDE the length prefix and inside the body.
@@ -119,7 +121,7 @@ describe('WebTransportTransport — framing', () => {
     const session = new FakeSession();
     const transport = await openTransport(session);
     const order: string[] = [];
-    transport.onMessage((p) => order.push(decode(p.payload)));
+    transport.onMessage((p: Packet) => order.push(decode(p.payload)));
 
     const a = frame(Packet.oneWay(1, text('a')));
     const b = frame(Packet.oneWay(2, text('b')));
@@ -135,7 +137,7 @@ describe('WebTransportTransport — framing', () => {
     const session = new FakeSession();
     const transport = await openTransport(session, { maxPayloadLen: 1024 });
     const errors: unknown[] = [];
-    transport.onError((e) => errors.push(e));
+    transport.onError((e: unknown) => errors.push(e));
 
     const evil = new Uint8Array(4);
     new DataView(evil.buffer).setUint32(0, 512 * 1024 * 1024, false);
@@ -149,7 +151,7 @@ describe('WebTransportTransport — framing', () => {
     const session = new FakeSession();
     const transport = await openTransport(session);
     const errors: unknown[] = [];
-    transport.onError((e) => errors.push(e));
+    transport.onError((e: unknown) => errors.push(e));
 
     const garbage = new Uint8Array(4 + 16);
     new DataView(garbage.buffer).setUint32(0, 16, false);
@@ -180,8 +182,8 @@ describe('WebTransportTransport — framing', () => {
 
     const received: Packet[] = [];
     const closes: unknown[] = [];
-    transport.onMessage((p) => received.push(p));
-    transport.onClose((ev) => closes.push(ev));
+    transport.onMessage((p: Packet) => received.push(p));
+    transport.onClose((ev?: unknown) => closes.push(ev));
 
     await old.push(frame(Packet.oneWay(1, text('ghost')))); // stale traffic
     old.close(); // stale close (already-resolved promise; re-resolve is a no-op)

@@ -5,9 +5,17 @@ import {
   Packet,
   PacketType,
 } from './packet.js';
-import { TransportError } from './errors.js';
+import { BackpressureError, TransportError } from './errors.js';
 import { CodecRegistry, type CompressionCodec, ZlibCodec } from './codec.js';
 import { InboundNormalizer } from './inbound-normalizer.js';
+
+/**
+ * Module-private construction token: `ClientMessage`/`ClientRequest` are
+ * created by the transport and NOWHERE else. A consumer-constructible
+ * ClientRequest could respond with an arbitrary messageId — the forgeable
+ * handle Rust 2.0 makes unrepresentable.
+ */
+const INTERNAL = Symbol('msgtrans.internal');
 import type { EnqueuedInfo, Transport } from './transport.js';
 import { RequestManager } from './request-manager.js';
 import {
@@ -50,6 +58,20 @@ export interface TransportClientOptions {
    * fits). Also bounds decompressed size.
    */
   limits?: Partial<DecodeLimits>;
+  /**
+   * Inbound normalization queue caps (packets queued behind an in-flight
+   * decompression). Overflow closes the connection: the browser cannot
+   * pause the socket, but it can refuse to buffer without limit.
+   * Defaults: 8192 frames / 64 MiB.
+   */
+  maxInboundQueueFrames?: number;
+  maxInboundQueueBytes?: number;
+  /**
+   * Outbound chain cap (sends queued behind an in-flight compression).
+   * Exceeding it rejects the send with `BackpressureError` — the
+   * connection stays healthy. Default 8192.
+   */
+  maxOutboundQueue?: number;
   /**
    * Additional compression codecs. `ZlibCodec` (native
    * Compression/DecompressionStream) is always registered; entries here can
@@ -102,7 +124,9 @@ export class TransportClient {
   private readonly requestManager: RequestManager;
   private readonly limits: DecodeLimits;
   private readonly codecs: CodecRegistry;
-  private readonly normalizer: InboundNormalizer;
+  private normalizer: InboundNormalizer;
+  private readonly inboundCaps: { maxFrames: number; maxBytes: number };
+  private readonly maxOutboundQueue: number;
   private readonly messageListeners: Array<(msg: ClientMessage) => void> = [];
   private readonly requestListeners: Array<(req: ClientRequest) => void> = [];
   private readonly messageEnqueuedListeners: Array<(info: EnqueuedInfo) => void> =
@@ -136,7 +160,12 @@ export class TransportClient {
       defaultTimeoutMs: options.defaultTimeoutMs,
     });
     this.codecs = new CodecRegistry([new ZlibCodec(), ...(options.codecs ?? [])]);
-    this.normalizer = new InboundNormalizer(this.codecs, this.limits);
+    this.inboundCaps = {
+      maxFrames: requireCap('maxInboundQueueFrames', options.maxInboundQueueFrames ?? 8192),
+      maxBytes: requireCap('maxInboundQueueBytes', options.maxInboundQueueBytes ?? 64 * 1024 * 1024),
+    };
+    this.maxOutboundQueue = requireCap('maxOutboundQueue', options.maxOutboundQueue ?? 8192);
+    this.normalizer = new InboundNormalizer(this.codecs, this.limits, this.inboundCaps);
     this.retryOpts = {
       maxRetries: options.connectRetry?.maxRetries ?? 0,
       initialDelayMs: options.connectRetry?.initialDelayMs ?? 100,
@@ -152,11 +181,6 @@ export class TransportClient {
     this.transport.onError((e) => this.dispatchError(e));
   }
 
-  /** The connection generation `ClientRequest`s validate against. */
-  get currentGeneration(): number {
-    return this.generation;
-  }
-
   /**
    * Open the transport with optional retry-on-failure.
    *
@@ -169,6 +193,11 @@ export class TransportClient {
    * thrown verbatim.
    */
   async connect(): Promise<void> {
+    // IDEMPOTENT: a connect() on a live connection is a no-op. The old
+    // behavior restarted the id generation unconditionally, so a redundant
+    // connect while a request was pending handed the NEXT request the same
+    // id and stranded the first promise forever.
+    if (this.transport.isConnected()) return;
     const total = this.retryOpts.maxRetries + 1;
     let lastError: unknown;
     for (let attempt = 0; attempt < total; attempt++) {
@@ -188,11 +217,17 @@ export class TransportClient {
       }
       try {
         await this.transport.connect();
-        // A fresh connection is a fresh id generation (Rust: a reconnect
-        // gets a fresh session with a fresh counter). Safe: the close that
-        // preceded it rejected every pending entry, and stale responders
-        // are refused by the generation guard.
+        // A fresh connection is a fresh generation: new id counter (Rust —
+        // a reconnect gets a fresh session with a fresh counter; safe, the
+        // close rejected every pending entry) and a NEW normalizer, so an
+        // old generation's in-flight decompression has nowhere to deliver
+        // and a poisoned stream does not leak into the replacement.
         this.requestManager.startGeneration();
+        this.normalizer = new InboundNormalizer(
+          this.codecs,
+          this.limits,
+          this.inboundCaps,
+        );
         return;
       } catch (e) {
         lastError = e;
@@ -269,8 +304,9 @@ export class TransportClient {
     return (await response).payload;
   }
 
-  /** INTERNAL — respond path for `ClientRequest`. */
-  respondTo(
+  /** Respond path, reachable only through the closure handed to
+   *  `ClientRequest` at construction. */
+  private respondTo(
     request: ClientRequest,
     payload: Uint8Array,
     options: SendOptions,
@@ -296,7 +332,7 @@ export class TransportClient {
       // may have turned over while the codec ran, and a response built for
       // generation N must never be written onto generation N+1 — on the
       // server it could complete a DIFFERENT request that drew the same id.
-      if (request.generation !== this.generation) {
+      if (!request.stillCurrent()) {
         throw new TransportError(
           'connection generation changed; response not sent',
         );
@@ -349,10 +385,20 @@ export class TransportClient {
     // bodies are decompressed exactly once, delivery order is arrival order,
     // and a packet that cannot be normalized closes the connection instead
     // of reaching the application as compressed bytes.
+    //
+    // GENERATION-BOUND: both callbacks are valid only for the generation the
+    // packet ARRIVED on. Reconnecting replaces the normalizer, and anything
+    // still in flight on the old one delivers into these guards — which
+    // refuse it. An old connection's bytes never surface as the new one's.
+    const generation = this.generation;
     this.normalizer.push(
       packet,
-      (p) => this.route(p),
+      (p) => {
+        if (this.generation !== generation) return;
+        this.route(p);
+      },
       (e) => {
+        if (this.generation !== generation) return;
         this.dispatchError(e);
         void this.transport.close();
       },
@@ -376,7 +422,12 @@ export class TransportClient {
       return;
     }
     if (packet.packetType === PacketType.Request) {
-      const req = new ClientRequest(packet, this, this.generation);
+      const generation = this.generation;
+      const req = new ClientRequest(INTERNAL, packet, {
+        isCurrent: () => this.generation === generation,
+        respond: (request, payload, options) =>
+          this.respondTo(request, payload, options),
+      });
       for (const cb of this.requestListeners) {
         try {
           cb(req);
@@ -386,7 +437,7 @@ export class TransportClient {
       }
       return;
     }
-    const msg = new ClientMessage(packet);
+    const msg = new ClientMessage(INTERNAL, packet);
     for (const cb of this.messageListeners) {
       try {
         cb(msg);
@@ -447,6 +498,13 @@ export class TransportClient {
   }
 
   private scheduleOutbound<T>(op: () => Promise<T>): Promise<T> {
+    if (this.outboundDepth >= this.maxOutboundQueue) {
+      // BOUNDED: a stalled compression cannot let sends pile up without
+      // limit. The connection stays healthy; the caller backs off.
+      return Promise.reject(
+        new BackpressureError(this.outboundDepth, this.maxOutboundQueue),
+      );
+    }
     this.outboundDepth += 1;
     const result = this.outboundChain.then(async () => {
       try {
@@ -497,7 +555,17 @@ export class TransportClient {
 /** A one-way message delivered to the application. Always plaintext: the
  *  inbound normalizer has already undone any compression. */
 export class ClientMessage {
-  constructor(private readonly packet: Packet) {}
+  private readonly packet: Packet;
+
+  /** @internal — constructed by the transport only. */
+  constructor(token: unknown, packet: Packet) {
+    if (token !== INTERNAL) {
+      throw new TransportError(
+        'ClientMessage is created by the transport, not by consumers',
+      );
+    }
+    this.packet = packet;
+  }
 
   get payload(): Uint8Array {
     return this.packet.payload;
@@ -525,14 +593,37 @@ export class ClientMessage {
  * response written after a reconnect could complete a DIFFERENT server-side
  * request that drew the same id.
  */
+interface RespondPath {
+  isCurrent: () => boolean;
+  respond: (
+    request: ClientRequest,
+    payload: Uint8Array,
+    options: SendOptions,
+  ) => Promise<void>;
+}
+
 export class ClientRequest {
   private respondedFlag = false;
+  private readonly packet: Packet;
+  private readonly path: RespondPath;
 
-  constructor(
-    private readonly packet: Packet,
-    private readonly client: TransportClient,
-    readonly generation: number,
-  ) {}
+  /** @internal — constructed by the transport only. An externally
+   *  constructible ClientRequest could respond with an arbitrary messageId,
+   *  which is exactly the forgeable handle this type exists to prevent. */
+  constructor(token: unknown, packet: Packet, path: RespondPath) {
+    if (token !== INTERNAL) {
+      throw new TransportError(
+        'ClientRequest is created by the transport, not by consumers',
+      );
+    }
+    this.packet = packet;
+    this.path = path;
+  }
+
+  /** @internal */
+  stillCurrent(): boolean {
+    return this.path.isCurrent();
+  }
 
   get payload(): Uint8Array {
     return this.packet.payload;
@@ -562,7 +653,7 @@ export class ClientRequest {
         ),
       );
     }
-    if (this.generation !== this.client.currentGeneration) {
+    if (!this.path.isCurrent()) {
       return Promise.reject(
         new TransportError(
           'connection generation changed; response not sent',
@@ -570,8 +661,15 @@ export class ClientRequest {
       );
     }
     this.respondedFlag = true;
-    return this.client.respondTo(this, payload, options);
+    return this.path.respond(this, payload, options);
   }
+}
+
+function requireCap(field: string, value: number): number {
+  if (!Number.isFinite(value) || value < 1) {
+    throw new TransportError(`invalid ${field}: ${value} (must be >= 1)`);
+  }
+  return Math.floor(value);
 }
 
 function resolveTransport(options: TransportClientOptions): Transport {
