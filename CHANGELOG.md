@@ -8,7 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 0.6.2-beta.0 — 2026-08-14
 
-**Final supervisor closure + API freeze prep** (tenth review).
+**Final supervisor closure + API freeze prep** (tenth review; the
+eleventh-review adapter-close fixes below shipped under the same version by
+reviewer decision — nothing was published in between).
+
+### Fixed (eleventh review)
+
+- The built-in WebSocket/WebTransport sessions no longer swallow a platform
+  `close()` that throws: local terminal state converges and the close event
+  fires FIRST, then the platform failure is propagated — so
+  `TransportClient.shutdown()`/`disconnect()` reject end-to-end instead of
+  reporting success over a still-open socket.
+- `WebSocketSession.close()` fixes the local close intent BEFORE calling
+  the platform close: a WebSocket whose `onclose` fires synchronously can
+  no longer relabel an intentional close as `intentional: false` (the field
+  reconnect managers key on). Caller `code`/`reason` now map onto
+  `ws.close(code, reason)` and WebTransport's `{ closeCode, reason }`.
+- The failed-installation rollback OWNS its close: `connect()` settles (and
+  retry dials the next attempt) only after the failed attempt's physical
+  link is released; if that close also fails, both errors stay visible in
+  the rejection.
 
 ### Fixed
 

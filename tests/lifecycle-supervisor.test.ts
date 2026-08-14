@@ -272,6 +272,43 @@ describe('lifecycle supervisor', () => {
     expect(client.isConnected()).toBe(true);
   });
 
+  it('a failed installation OWNS its rollback close: connect() settles only after the link is released', async () => {
+    const connector = new ManualConnector();
+    connector.nextSubscribeError = new Error('subscribe exploded');
+    connector.nextCloseMode = 'pending';
+    const client = new TransportClient({ connector });
+
+    let settled = false;
+    const attempt = client.connect();
+    attempt.catch(() => {}).then(() => {
+      settled = true;
+    });
+    await flush();
+    // subscribe already threw, but the rollback close is still pending:
+    // connect() must NOT have settled with the physical link still open.
+    expect(settled).toBe(false);
+    expect(connector.sessions[0]!.isOpen()).toBe(true);
+
+    connector.sessions[0]!.releaseClose();
+    await expect(attempt).rejects.toThrow('subscribe exploded');
+    expect(settled).toBe(true);
+    expect(connector.sessions[0]!.isOpen()).toBe(false);
+  });
+
+  it('when the rollback close ALSO fails, both errors stay visible', async () => {
+    const connector = new ManualConnector();
+    connector.nextSubscribeError = new Error('subscribe exploded');
+    connector.nextCloseMode = 'reject';
+    const client = new TransportClient({ connector });
+
+    const rejection = await client.connect().then(
+      () => null,
+      (e: Error) => e.message,
+    );
+    expect(rejection).toContain('subscribe exploded');
+    expect(rejection).toContain('close exploded');
+  });
+
   it('disconnect() interrupts the retry backoff instead of sleeping it out', async () => {
     const connector = new ManualConnector();
     connector.connectError = new Error('dial refused');

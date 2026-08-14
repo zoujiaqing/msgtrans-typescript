@@ -244,17 +244,26 @@ class WebSocketSession implements TransportSession {
 
   close(event?: Partial<TransportCloseEvent>): Promise<void> {
     if (!this.open) return Promise.resolve();
-    try {
-      this.ws.close();
-    } catch {
-      /* the deterministic close below still runs */
-    }
-    // Deterministic: do not depend on the platform ever firing onclose.
+    // Fix the local close intent BEFORE touching the platform: a WebSocket
+    // whose onclose fires synchronously inside close() must not win the race
+    // and mislabel this intentional close as a network drop. (This is also
+    // the deterministic close — we never depend on onclose firing at all.)
     this.handleClose({
       intentional: true,
       reason: 'closed locally',
       ...event,
     });
+    try {
+      // Map the caller's code/reason onto the wire close frame when given.
+      if (event?.code !== undefined) this.ws.close(event.code, event.reason);
+      else this.ws.close();
+    } catch (e) {
+      // Local terminal state already converged and the close event fired;
+      // the caller still learns the platform release failed.
+      return Promise.reject(
+        e instanceof Error ? e : new TransportError(String(e)),
+      );
+    }
     return Promise.resolve();
   }
 

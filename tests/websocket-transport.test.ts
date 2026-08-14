@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import {
   Packet,
   PacketType,
+  TransportClient,
   TransportError,
   TransportState,
   WebSocketConnector,
@@ -324,5 +325,76 @@ describe('WebSocketConnector — close + error events', () => {
     m.fireError({ message: 'boom' });
 
     expect(errors).toHaveLength(1);
+  });
+});
+
+describe('WebSocketSession — close semantics (eleventh review)', () => {
+  class ThrowingCloseWebSocket extends MockWebSocket {
+    closeError: Error | null = null;
+    override close(code?: number, reason?: string): void {
+      if (this.closeError) throw this.closeError; // stays OPEN
+      super.close(code, reason);
+    }
+  }
+
+  class SyncCloseWebSocket extends MockWebSocket {
+    override close(code?: number, reason?: string): void {
+      this.closeCalls.push({ code, reason });
+      this.readyState = MockWebSocket.CLOSED;
+      // SYNCHRONOUS platform onclose — fires inside session.close().
+      this.onclose?.({ code: 1000, reason: 'platform sync', wasClean: true });
+    }
+  }
+
+  it('a platform close() that throws is propagated AFTER local convergence', async () => {
+    const mock = new ThrowingCloseWebSocket();
+    const link = await openLink(makeConnector(mock), mock);
+    const closes: unknown[] = [];
+    link.subscribe({ onClose: (ev) => closes.push(ev) });
+    mock.closeError = new Error('platform close exploded');
+
+    await expect(link.close()).rejects.toThrow('platform close exploded');
+    // Local terminal state converged and the close event fired first.
+    expect(link.isOpen()).toBe(false);
+    expect(closes).toEqual([
+      { intentional: true, reason: 'closed locally' },
+    ]);
+  });
+
+  it('shutdown() surfaces a throwing platform close over the whole stack', async () => {
+    const mock = new ThrowingCloseWebSocket();
+    const client = new TransportClient({ connector: makeConnector(mock) });
+    const p = client.connect();
+    mock.fireOpen();
+    await p;
+    mock.closeError = new Error('platform close exploded');
+
+    await expect(client.shutdown()).rejects.toThrow('platform close exploded');
+    expect(client.state).toBe(TransportState.Stopped);
+  });
+
+  it('a synchronous platform onclose cannot relabel an intentional close', async () => {
+    const mock = new SyncCloseWebSocket();
+    const link = await openLink(makeConnector(mock), mock);
+    const closes: Array<{ intentional?: boolean }> = [];
+    link.subscribe({
+      onClose: (ev) => closes.push(ev as { intentional?: boolean }),
+    });
+
+    await link.close({ intentional: true, reason: 'wanted' });
+    expect(closes).toHaveLength(1);
+    expect(closes[0]!.intentional).toBe(true);
+  });
+
+  it('maps the caller close code/reason onto the wire close frame', async () => {
+    const mock = new MockWebSocket();
+    const link = await openLink(makeConnector(mock), mock);
+    await link.close({ code: 4000, reason: 'bye' });
+    expect(mock.closeCalls).toEqual([{ code: 4000, reason: 'bye' }]);
+
+    const mock2 = new MockWebSocket();
+    const link2 = await openLink(makeConnector(mock2), mock2);
+    await link2.close();
+    expect(mock2.closeCalls).toEqual([{ code: undefined, reason: undefined }]);
   });
 });

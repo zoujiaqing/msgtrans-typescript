@@ -41,9 +41,9 @@ class FakeWt implements WebTransportLike {
     this.clientWritable = c2s.writable;
   }
 
-  close(): void {
+  close(closeInfo?: { closeCode?: number; reason?: string }): void {
     this.closeCalls += 1;
-    this.resolveClosed({ closeCode: 0 });
+    this.resolveClosed(closeInfo ?? { closeCode: 0 });
   }
 
   async createBidirectionalStream() {
@@ -244,5 +244,50 @@ describe('WebTransportConnector — under a full TransportClient', () => {
     expect(decode(response)).toBe('answered over WT');
     await serve;
     await client.disconnect();
+  });
+});
+
+describe('WebTransportSession — close semantics (eleventh review)', () => {
+  it('a platform close() that throws is propagated AFTER local convergence', async () => {
+    const wt = new FakeWt();
+    let closeError: Error | null = null;
+    const origClose = wt.close.bind(wt);
+    wt.close = (info?: { closeCode?: number; reason?: string }) => {
+      if (closeError) throw closeError;
+      origClose(info);
+    };
+    const connector = new WebTransportConnector({
+      url: 'https://test.invalid/wt',
+      webTransportFactory: () => wt,
+    });
+    const link = await connector.connect({
+      signal: new AbortController().signal,
+    });
+    const closes: unknown[] = [];
+    link.subscribe({ onClose: (ev) => closes.push(ev) });
+    closeError = new Error('platform close exploded');
+
+    await expect(link.close()).rejects.toThrow('platform close exploded');
+    expect(link.isOpen()).toBe(false);
+    expect(closes).toEqual([{ intentional: true, reason: 'closed locally' }]);
+  });
+
+  it('maps the caller close code/reason onto the WebTransport close info', async () => {
+    const wt = new FakeWt();
+    const infos: unknown[] = [];
+    const origClose = wt.close.bind(wt);
+    wt.close = (info?: { closeCode?: number; reason?: string }) => {
+      infos.push(info);
+      origClose(info);
+    };
+    const connector = new WebTransportConnector({
+      url: 'https://test.invalid/wt',
+      webTransportFactory: () => wt,
+    });
+    const link = await connector.connect({
+      signal: new AbortController().signal,
+    });
+    await link.close({ code: 7, reason: 'bye' });
+    expect(infos).toEqual([{ closeCode: 7, reason: 'bye' }]);
   });
 });

@@ -161,12 +161,22 @@ class WebTransportSession implements TransportSession {
 
   close(event?: Partial<TransportCloseEvent>): Promise<void> {
     if (!this.open) return Promise.resolve();
-    try {
-      this.wt.close();
-    } catch {
-      /* deterministic close below still runs */
-    }
+    // Local intent first (see WebSocketSession.close): a synchronous platform
+    // callback must not relabel an intentional close, and convergence must
+    // not depend on the platform at all.
     this.handleClose({ intentional: true, reason: 'closed locally', ...event });
+    try {
+      // Map the caller's code/reason onto the WebTransport close info.
+      if (event?.code !== undefined || event?.reason !== undefined) {
+        this.wt.close({ closeCode: event.code, reason: event.reason });
+      } else {
+        this.wt.close();
+      }
+    } catch (e) {
+      return Promise.reject(
+        e instanceof Error ? e : new TransportError(String(e)),
+      );
+    }
     return Promise.resolve();
   }
 

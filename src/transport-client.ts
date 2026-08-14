@@ -347,7 +347,7 @@ export class TransportClient {
             .catch(() => {});
           throw new TransportError('connect aborted');
         }
-        this.installSession(link);
+        await this.installSession(link);
         this._state = TransportState.Open;
         return;
       } catch (e) {
@@ -366,7 +366,7 @@ export class TransportClient {
     throw lastError;
   }
 
-  private installSession(link: TransportSession): void {
+  private async installSession(link: TransportSession): Promise<void> {
     this.retireSession(new TransportError('connection superseded'));
     const session = new ClientSession(
       link,
@@ -404,9 +404,21 @@ export class TransportClient {
     } catch (e) {
       if (this.session === session) this.session = null;
       session.retire(new TransportError('subscribe failed'));
-      void link
-        .close({ intentional: true, reason: 'subscribe failed', cause: e })
-        .catch(() => {});
+      // The installation OWNS the rollback: connect() must not settle (or
+      // retry, dialing a second connection) while the physical link from the
+      // failed attempt is still being released.
+      try {
+        await link.close({
+          intentional: true,
+          reason: 'subscribe failed',
+          cause: e,
+        });
+      } catch (closeError) {
+        // Keep BOTH failures visible.
+        throw new TransportError(
+          `subscribe failed: ${describe(e)}; releasing the connection also failed: ${describe(closeError)}`,
+        );
+      }
       throw e instanceof Error ? e : new TransportError(String(e));
     }
     // Runs immediately when the session already retired during subscribe():
@@ -942,6 +954,10 @@ function resolveConnector(options: TransportClientOptions): TransportConnector {
     maxBufferedBytes: options.maxBufferedBytes,
     limits: options.limits,
   });
+}
+
+function describe(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function removeFrom<T>(arr: T[], item: T): void {
