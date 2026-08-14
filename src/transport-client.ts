@@ -115,6 +115,19 @@ export interface ClientRequest {
 }
 
 /**
+ * INTERNAL, non-retryable: a failed installation could not release its
+ * physical link. Retrying now could succeed and leave TWO live connections —
+ * the connect must terminate instead. Not exported: consumers see a
+ * TransportError; the class exists so doConnect can recognize it.
+ */
+class InstallationCleanupError extends TransportError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InstallationCleanupError';
+  }
+}
+
+/**
  * ONE connection's client-side ownership unit, now BOUND to its
  * `TransportSession`: the physical connection, id allocator, request
  * registry, normalizer, outbound queue and codec abort signal all live and
@@ -351,7 +364,14 @@ export class TransportClient {
         this._state = TransportState.Open;
         return;
       } catch (e) {
-        if (abort.signal.aborted || this.stateNow() === TransportState.Stopped) {
+        if (
+          e instanceof InstallationCleanupError ||
+          abort.signal.aborted ||
+          this.stateNow() === TransportState.Stopped
+        ) {
+          // A cleanup failure is NON-retryable: the failed attempt's link
+          // may still be open, and a successful redial would leave two live
+          // physical connections.
           if (this._state === TransportState.Connecting) {
             this._state = TransportState.Idle;
           }
@@ -414,8 +434,9 @@ export class TransportClient {
           cause: e,
         });
       } catch (closeError) {
-        // Keep BOTH failures visible.
-        throw new TransportError(
+        // Keep BOTH failures visible — and mark the result NON-RETRYABLE:
+        // the old physical link may still be open.
+        throw new InstallationCleanupError(
           `subscribe failed: ${describe(e)}; releasing the connection also failed: ${describe(closeError)}`,
         );
       }

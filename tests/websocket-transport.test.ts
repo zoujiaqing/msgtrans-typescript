@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -179,10 +179,18 @@ describe('WebSocketConnector — connection lifecycle', () => {
   });
 
   it('throws TransportError when no global WebSocket and no factory', async () => {
-    const t = new WebSocketConnector({ url: 'ws://test.invalid' });
-    await expect(
-      t.connect({ signal: freshSignal() }),
-    ).rejects.toBeInstanceOf(TransportError);
+    // Node >= 22 SHIPS globalThis.WebSocket — without the stub this test
+    // would really dial test.invalid and depend on DNS timing. Stub it out
+    // to test the actual missing-platform path deterministically.
+    vi.stubGlobal('WebSocket', undefined);
+    try {
+      const t = new WebSocketConnector({ url: 'ws://test.invalid' });
+      await expect(t.connect({ signal: freshSignal() })).rejects.toThrow(
+        'no global WebSocket available',
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

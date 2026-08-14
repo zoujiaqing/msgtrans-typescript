@@ -295,6 +295,28 @@ describe('lifecycle supervisor', () => {
     expect(connector.sessions[0]!.isOpen()).toBe(false);
   });
 
+  it('a cleanup failure is NON-retryable: no redial after a rollback close that failed', async () => {
+    const connector = new ManualConnector();
+    // Attempt 1: subscribe throws AND the rollback close rejects (session
+    // stays open). Attempt 2 WOULD succeed — it must never happen.
+    connector.nextSubscribeError = new Error('subscribe exploded');
+    connector.nextCloseMode = 'reject';
+    const client = new TransportClient({
+      connector,
+      connectRetry: { maxRetries: 1, initialDelayMs: 0 },
+    });
+    const attempt = client.connect();
+    attempt.catch(() => {});
+    // Let attempt 1 fail; then clear the fault so a retry WOULD succeed.
+    await flush();
+    connector.nextSubscribeError = null;
+    connector.nextCloseMode = 'resolve';
+
+    await expect(attempt).rejects.toThrow('releasing the connection also failed');
+    expect(connector.connectCalls).toBe(1); // NO second dial
+    expect(client.state).toBe(TransportState.Idle);
+  });
+
   it('when the rollback close ALSO fails, both errors stay visible', async () => {
     const connector = new ManualConnector();
     connector.nextSubscribeError = new Error('subscribe exploded');

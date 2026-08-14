@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 eleventh-review adapter-close fixes below shipped under the same version by
 reviewer decision — nothing was published in between).
 
+### Fixed (twelfth review)
+
+- A rollback close that itself fails is now NON-retryable
+  (`InstallationCleanupError`, internal): the failed attempt's physical
+  link may still be open, and a successful redial would leave two live
+  connections — `connect()` terminates to Idle instead of retrying.
+- The missing-WebSocket test stubs `globalThis.WebSocket` (Node ≥ 22 ships
+  one): the publish gate no longer really dials `test.invalid` and depend
+  on DNS timing.
+
 ### Fixed (eleventh review)
 
 - The built-in WebSocket/WebTransport sessions no longer swallow a platform
