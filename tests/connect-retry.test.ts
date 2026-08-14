@@ -52,19 +52,20 @@ describe('TransportClient — connectRetry', () => {
     await tick(100);
     await expectation;
     expect(t.connectCalls).toHaveLength(4);
-    // close() is called between retries to reset state — once per retry,
-    // so 3 close calls for 3 retries.
-    expect(t.closeCalls).toHaveLength(3);
+    // Connector-model: a failed dial never produced a session, so there is
+    // nothing to close between retries (the old shared-Transport needed a
+    // reset; a factory does not).
+    expect(t.sessions).toHaveLength(0);
   });
 
   it('maxRetries = 3, second attempt succeeds → 2 attempts only', async () => {
     const t = new FakeTransport();
     let attempts = 0;
     const origConnect = t.connect.bind(t);
-    t.connect = async () => {
+    t.connect = async (opts) => {
       attempts++;
       if (attempts === 1) throw new TransportError('first fails');
-      await origConnect();
+      return origConnect(opts);
     };
     const c = new TransportClient({
       transport: t,

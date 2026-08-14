@@ -16,7 +16,7 @@ import {
 // INTERNAL import: RequestManager is deliberately absent from the public
 // surface (ids belong to the transport); tests reach in directly.
 import { RequestManager } from '../src/request-manager.js';
-import { FakeTransport } from './fake-transport.js';
+import { FakeSession } from './fake-transport.js';
 
 function newRequestPacket(): Packet {
   return new Packet({ packetType: PacketType.OneWay, messageId: 0 });
@@ -32,7 +32,7 @@ function makeResponse(messageId: number, body = ''): Packet {
 
 describe('RequestManager — request lifecycle', () => {
   it('sets packetType=Request and allocates messageId', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
 
     const packet = new Packet({
@@ -54,7 +54,7 @@ describe('RequestManager — request lifecycle', () => {
   });
 
   it('handles multiple concurrent requests with out-of-order responses', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
 
     const p1 = m.request(newRequestPacket());
@@ -78,7 +78,7 @@ describe('RequestManager — request lifecycle', () => {
 
 describe('RequestManager — handleIncoming', () => {
   it('returns false for non-Response packets', () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     expect(
       m.handleIncoming(
@@ -93,7 +93,7 @@ describe('RequestManager — handleIncoming', () => {
   });
 
   it('returns false for unmatched Response messageId', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket());
 
@@ -114,7 +114,7 @@ describe('RequestManager — timeout', () => {
   });
 
   it('rejects with RequestTimeoutError after timeoutMs and cleans pending', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket(), { timeoutMs: 100 });
 
@@ -131,7 +131,7 @@ describe('RequestManager — timeout', () => {
   });
 
   it('does not start a timer when timeoutMs=0', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket(), { timeoutMs: 0 });
 
@@ -143,7 +143,7 @@ describe('RequestManager — timeout', () => {
   });
 
   it('uses defaultTimeoutMs from constructor', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t, { defaultTimeoutMs: 50 });
     const promise = m.request(newRequestPacket());
     const expectation = expect(promise).rejects.toBeInstanceOf(
@@ -156,7 +156,7 @@ describe('RequestManager — timeout', () => {
 
 describe('RequestManager — send (OneWay / Response passthrough)', () => {
   it('allocates messageId when 0 and does not register pending', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const p = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
     await m.send(p);
@@ -166,7 +166,7 @@ describe('RequestManager — send (OneWay / Response passthrough)', () => {
   });
 
   it('sendResponse() preserves the originating id — and ONLY accepts Responses', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const p = new Packet({ packetType: PacketType.Response, messageId: 42 });
     await m.sendResponse(p);
@@ -183,7 +183,7 @@ describe('RequestManager — send (OneWay / Response passthrough)', () => {
   });
 
   it('send() overwrites any caller-set id: ids belong to the transport', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const p = new Packet({ packetType: PacketType.OneWay, messageId: 999 });
     await m.send(p);
@@ -191,7 +191,7 @@ describe('RequestManager — send (OneWay / Response passthrough)', () => {
   });
 
   it('shares the counter between request() and send()', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
 
     const a = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
@@ -210,7 +210,7 @@ describe('RequestManager — id exhaustion (never wraps)', () => {
     // Responses are matched on the bare u32; a wrapped id could complete a
     // DIFFERENT still-pending request. Exhaustion is explicit, and a
     // reconnect starts a fresh generation.
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t, { initialMessageId: 0xfffffffe });
 
     const p1 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
@@ -226,15 +226,18 @@ describe('RequestManager — id exhaustion (never wraps)', () => {
       IdExhaustedError,
     );
 
-    // A fresh connection generation restarts the space.
-    m.startGeneration();
+    // A fresh connection restarts the space by constructing a NEW manager —
+    // the manager is per-session now; there is no in-place restart to call.
+    const m2 = new RequestManager(new FakeSession(), {
+      initialMessageId: 0xfffffffe,
+    });
     const p4 = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
-    await m.send(p4);
+    await m2.send(p4);
     expect(p4.messageId).toBe(0xfffffffe);
   });
 
   it('treats initialMessageId=0 as 1', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t, { initialMessageId: 0 });
     const p = new Packet({ packetType: PacketType.OneWay, messageId: 0 });
     await m.send(p);
@@ -244,7 +247,7 @@ describe('RequestManager — id exhaustion (never wraps)', () => {
 
 describe('RequestManager — reset', () => {
   it('rejects all pending requests', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const p1 = m.request(newRequestPacket());
     const p2 = m.request(newRequestPacket());
@@ -261,7 +264,7 @@ describe('RequestManager — reset', () => {
     // A manager belongs to ONE session; the session's owner resets it.
     // Self-subscribing leaked a listener per reconnect (the Transport SPI
     // has no unsubscribe) and re-created shared-mutable coupling.
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket());
     await Promise.resolve();
@@ -277,7 +280,7 @@ describe('RequestManager — reset', () => {
     // and resets it. Errors and even close events on the transport leave the
     // manager untouched until the owner acts (TransportClient retires the
     // session on close and resets its manager there).
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     const promise = m.request(newRequestPacket());
     await Promise.resolve();
@@ -292,7 +295,7 @@ describe('RequestManager — reset', () => {
   });
 
   it('is a no-op when no pending', () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     const m = new RequestManager(t);
     expect(() => m.reset()).not.toThrow();
   });
@@ -300,7 +303,7 @@ describe('RequestManager — reset', () => {
 
 describe('RequestManager — send error', () => {
   it('rejects request and cleans pending if transport.send rejects', async () => {
-    const t = new FakeTransport();
+    const t = new FakeSession();
     t.sendShouldFail = new Error('send failed');
     const m = new RequestManager(t);
 

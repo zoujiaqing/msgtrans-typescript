@@ -4,11 +4,17 @@ import {
   Packet,
   ReservedFlag,
 } from './packet.js';
-import { BackpressureError, TransportError, WireFormatError } from './errors.js';
 import {
-  type EnqueuedInfo,
-  type Transport,
-  TransportState,
+  BackpressureError,
+  TransportError,
+  WireFormatError,
+} from './errors.js';
+import type {
+  ConnectOptions,
+  EnqueuedInfo,
+  TransportConnector,
+  TransportObserver,
+  TransportSession,
 } from './transport.js';
 import { requireNonNegativeFinite } from './validate.js';
 
@@ -34,38 +40,21 @@ export type WebSocketFactory = (
 
 export type TextFramePolicy = 'error' | 'ignore';
 
-export interface WebSocketTransportOptions {
+export interface WebSocketConnectorOptions {
   url: string;
   protocols?: string | string[];
-  /**
-   * Override the WebSocket constructor. Defaults to `globalThis.WebSocket`.
-   * Use this to inject `ws` in Node, or a mock in tests.
-   */
+  /** Override the WebSocket constructor. Defaults to `globalThis.WebSocket`. */
   webSocketFactory?: WebSocketFactory;
-  /**
-   * What to do with WebSocket text frames. msgtrans canonical traffic is
-   * Binary-only (see WIRE_FORMAT.md §9.1); a text frame is non-protocol
-   * traffic. Default `'error'`: report and CLOSE the connection (strict,
-   * matching Rust 2.0's frame policy — a desynchronized peer is not
-   * trustworthy). `'ignore'` drops them silently.
-   */
+  /** Text frames are non-protocol traffic. Default `'error'`: report and
+   *  CLOSE (strict). `'ignore'` drops them silently. */
   onTextFrame?: TextFramePolicy;
   /**
-   * Outbound-buffer high-water mark in bytes. `send()` rejects with
-   * `BackpressureError` when the socket's `bufferedAmount` PLUS this frame
-   * would exceed the mark — the projection matters: checking only the
-   * current level let a 10 MiB frame sail through at 15.9/16 MiB. The
-   * connection itself is left open. Default 16 MiB; `0` disables the check.
-   * Sockets that don't report `bufferedAmount` are never rejected.
+   * Outbound-buffer high-water mark in bytes. `enqueue()` rejects with
+   * `BackpressureError` when `bufferedAmount` PLUS this frame would exceed
+   * the mark. The connection stays open. Default 16 MiB; `0` disables.
    */
   maxBufferedBytes?: number;
-  /**
-   * Frame-decoding caps, enforced in BOTH directions with the same numbers
-   * (mirroring Rust 2.0, where one `DecodeLimits` serves every protocol):
-   * inbound frames over the caps close the connection; outbound frames over
-   * the caps are rejected here instead of letting the server kill the
-   * connection over them. Defaults match the Rust defaults.
-   */
+  /** Frame caps, both directions. Defaults mirror the Rust 2.0 defaults. */
   limits?: Partial<DecodeLimits>;
 }
 
@@ -87,21 +76,19 @@ function defaultWebSocketFactory(
   return new Ctor(url, protocols);
 }
 
-export class WebSocketTransport implements Transport {
-  private readonly opts: WebSocketTransportOptions;
+/**
+ * WebSocket connector: CONFIGURATION only. Every `connect()` dials a fresh
+ * socket and hands it to a brand-new `WebSocketSession` that owns it — there
+ * is no shared mutable connection state for a late event to revive or an old
+ * send to leak through. (The previous shared-Transport shape produced exactly
+ * those faults: a late onopen flipping Closed back to Open, an old socket's
+ * traffic delivered as the new one's.)
+ */
+export class WebSocketConnector implements TransportConnector {
+  private readonly opts: WebSocketConnectorOptions;
   private readonly limits: DecodeLimits;
-  private ws: WebSocketLike | null = null;
-  private _state: TransportState = TransportState.Idle;
-  private readonly messageHandlers: Array<(p: Packet) => void> = [];
-  private readonly messageEnqueuedHandlers: Array<(info: EnqueuedInfo) => void> =
-    [];
-  private readonly closeHandlers: Array<(ev?: unknown) => void> = [];
-  private readonly errorHandlers: Array<(e: unknown) => void> = [];
-  private connectPromise: Promise<void> | null = null;
-  private connectResolve: (() => void) | null = null;
-  private connectReject: ((e: unknown) => void) | null = null;
 
-  constructor(opts: WebSocketTransportOptions) {
+  constructor(opts: WebSocketConnectorOptions) {
     if (opts.maxBufferedBytes !== undefined) {
       requireNonNegativeFinite('maxBufferedBytes', opts.maxBufferedBytes);
     }
@@ -109,124 +96,131 @@ export class WebSocketTransport implements Transport {
     this.limits = normalizeDecodeLimits(opts.limits);
   }
 
-  get state(): TransportState {
-    return this._state;
-  }
-
-  isConnected(): boolean {
-    return this._state === TransportState.Open;
-  }
-
-  connect(): Promise<void> {
-    if (this._state === TransportState.Open) return Promise.resolve();
-    if (this._state === TransportState.Connecting && this.connectPromise) {
-      return this.connectPromise;
+  connect(options: ConnectOptions): Promise<TransportSession> {
+    const { signal } = options;
+    if (signal.aborted) {
+      return Promise.reject(new TransportError('connect aborted'));
     }
-    if (
-      this._state !== TransportState.Idle &&
-      this._state !== TransportState.Closed
-    ) {
-      return Promise.reject(
-        new TransportError(`cannot connect in state ${this._state}`),
-      );
-    }
-
-    this._state = TransportState.Connecting;
     const factory = this.opts.webSocketFactory ?? defaultWebSocketFactory;
-
     let ws: WebSocketLike;
     try {
       ws = factory(this.opts.url, this.opts.protocols);
     } catch (e) {
-      this._state = TransportState.Closed;
       return Promise.reject(e);
     }
     ws.binaryType = 'arraybuffer';
-    this.ws = ws;
 
-    this.connectPromise = new Promise<void>((resolve, reject) => {
-      this.connectResolve = resolve;
-      this.connectReject = reject;
+    return new Promise<TransportSession>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        // Cancel AND release: the socket must not keep connecting toward a
+        // caller that already gave up.
+        detach();
+        try {
+          ws.close();
+        } catch {
+          /* already dead */
+        }
+        reject(new TransportError('connect aborted'));
+      };
+      const detach = () => {
+        signal.removeEventListener('abort', onAbort);
+        ws.onopen = null;
+        ws.onerror = null;
+        ws.onclose = null;
+      };
+      signal.addEventListener('abort', onAbort);
+
+      ws.onopen = () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(new WebSocketSession(ws, this.opts, this.limits));
+      };
+      ws.onerror = (ev) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        try {
+          ws.close();
+        } catch {
+          /* already dead */
+        }
+        reject(ev instanceof Error ? ev : new TransportError('WebSocket error'));
+      };
+      ws.onclose = (ev) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        reject(
+          new TransportError(
+            `connection closed before open: ${JSON.stringify(ev ?? null)}`,
+          ),
+        );
+      };
     });
+  }
+}
 
-    // GENERATION ISOLATION: every handler closes over ITS socket and bails
-    // unless that socket is still the current one. Without this, a previous
-    // socket's late-arriving onclose/onerror/onmessage acted on the shared
-    // instance — closing the REPLACEMENT connection's state, nuking its
-    // pending requests, or delivering the old generation's traffic into the
-    // new one. This is the client-side twin of Rust 2.0's slot generations.
-    const isCurrent = () => this.ws === ws;
-    ws.onopen = () => {
-      if (!isCurrent()) return;
-      this._state = TransportState.Open;
-      const resolve = this.connectResolve;
-      this.connectResolve = null;
-      this.connectReject = null;
-      resolve?.();
-    };
-    ws.onmessage = (ev) => {
-      if (!isCurrent()) return;
-      this.handleMessage(ev);
-    };
-    ws.onerror = (ev) => {
-      if (!isCurrent()) return;
-      this.handleError(ev);
-    };
-    ws.onclose = (ev) => {
-      if (!isCurrent()) return;
-      this.handleClose(ev);
-    };
+/** One live WebSocket connection. */
+class WebSocketSession implements TransportSession {
+  private readonly observers: TransportObserver[] = [];
+  private open = true;
 
-    return this.connectPromise;
+  constructor(
+    private readonly ws: WebSocketLike,
+    private readonly opts: WebSocketConnectorOptions,
+    private readonly limits: DecodeLimits,
+  ) {
+    // The session takes over the socket's handlers for its whole life. A
+    // handler firing after close is harmless: `open` gates every path.
+    ws.onmessage = (ev) => this.handleMessage(ev);
+    ws.onerror = (ev) => this.dispatchError(ev);
+    ws.onclose = (ev) => this.handleClose(ev);
   }
 
-  send(packet: Packet): Promise<void> {
-    if (this._state !== TransportState.Open || !this.ws) {
-      return Promise.reject(
-        new TransportError(`cannot send in state ${this._state}`),
-      );
+  isOpen(): boolean {
+    return this.open;
+  }
+
+  enqueue(packet: Packet): Promise<EnqueuedInfo> {
+    if (!this.open) {
+      return Promise.reject(new TransportError('session is closed'));
     }
     if (packet.hasFlag(ReservedFlag.Fragmented)) {
-      // Refuse to ship a mechanism nothing implements: a Fragmented frame
-      // promises reassembly the receiver cannot perform.
       return Promise.reject(
         new WireFormatError(
           'ReservedFlag.Fragmented is not supported over WebSocket transport',
         ),
       );
     }
-    // Backpressure guard: PROJECTED, not current-level — the question is
-    // whether the buffer would exceed the mark AFTER this frame, otherwise a
-    // large frame at 15.9/16 MiB sails through. `totalLength()` is the exact
-    // wire size, so the projection costs no encode.
+    // Projected backpressure: current buffer PLUS this frame.
     const max = this.opts.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
     const buffered = this.ws.bufferedAmount;
-    if (max > 0 && buffered !== undefined && buffered + packet.totalLength() > max) {
+    if (
+      max > 0 &&
+      buffered !== undefined &&
+      buffered + packet.totalLength() > max
+    ) {
       return Promise.reject(new BackpressureError(buffered, max));
     }
-    // Encode OUTSIDE the socket try: an encode failure (over-limit
-    // ext-header/payload) is the caller's packet problem — it must
-    // reject this send but never affect the connection.
     let bytes: Uint8Array;
     try {
       bytes = packet.encode(this.limits);
     } catch (e) {
+      // The caller's packet problem, never the connection's.
       return Promise.reject(e);
     }
     try {
       this.ws.send(bytes);
     } catch (e) {
-      // ws.send() threw synchronously. Browsers throw when the socket
-      // closed mid-call (INVALID_STATE_ERR) — but the `onclose` event
-      // may lag behind, leaving this transport claiming Open against a
-      // dead socket. If readyState says the socket is no longer OPEN,
-      // drive the close path NOW (idempotent — the eventual real
-      // onclose becomes a no-op) so request managers reject pending
-      // work and reconnect state machines react immediately. A throw
-      // while readyState is still OPEN (exotic) stays a plain
-      // per-send rejection: the connection is not assumed dead.
       const WS_OPEN = 1;
       if (this.ws.readyState !== WS_OPEN) {
+        // The socket died and its onclose is lagging: drive the close NOW so
+        // the owner reacts immediately (idempotent — the real onclose is a
+        // no-op afterwards).
         this.handleClose({
           code: 1006,
           reason: 'send failed on dead socket',
@@ -236,71 +230,32 @@ export class WebSocketTransport implements Transport {
       }
       return Promise.reject(e);
     }
-    const info: EnqueuedInfo = { messageId: packet.messageId };
-    for (const cb of this.messageEnqueuedHandlers) {
-      try {
-        cb(info);
-      } catch {
-        /* swallow */
-      }
-    }
-    return Promise.resolve();
+    return Promise.resolve({ messageId: packet.messageId });
   }
 
-  close(): Promise<void> {
-    if (
-      this._state === TransportState.Closed ||
-      this._state === TransportState.Idle
-    ) {
-      return Promise.resolve();
-    }
-    if (this._state === TransportState.Closing) {
-      return Promise.resolve();
-    }
-    const wasConnecting = this._state === TransportState.Connecting;
-    this._state = TransportState.Closing;
-    // DETACH FIRST: from here on, every late platform event on this socket —
-    // onclose, onerror, and crucially a late onopen — fails its isCurrent()
-    // check and cannot revive the state machine. Deterministic close does
-    // not depend on the platform ever firing onclose.
-    const ws = this.ws;
-    this.ws = null;
+  subscribe(observer: TransportObserver): () => void {
+    this.observers.push(observer);
+    return () => {
+      const i = this.observers.indexOf(observer);
+      if (i >= 0) this.observers.splice(i, 1);
+    };
+  }
+
+  close(reason?: unknown): Promise<void> {
+    if (!this.open) return Promise.resolve();
     try {
-      ws?.close();
+      this.ws.close();
     } catch {
       /* the deterministic close below still runs */
     }
-    if (wasConnecting) {
-      // CANCEL SAFETY: a close during the handshake must settle the pending
-      // connect() — a hung handshake may never fire onclose.
-      const reject = this.connectReject;
-      this.connectResolve = null;
-      this.connectReject = null;
-      reject?.(new TransportError('connection closed during connect'));
-    }
-    this.handleClose({ reason: 'closed locally' });
+    // Deterministic: do not depend on the platform ever firing onclose.
+    this.handleClose(reason ?? { reason: 'closed locally' });
     return Promise.resolve();
   }
 
-  onMessage(cb: (packet: Packet) => void): void {
-    this.messageHandlers.push(cb);
-  }
-
-  onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void {
-    this.messageEnqueuedHandlers.push(cb);
-  }
-
-  onClose(cb: (event?: unknown) => void): void {
-    this.closeHandlers.push(cb);
-  }
-
-  onError(cb: (error: unknown) => void): void {
-    this.errorHandlers.push(cb);
-  }
-
   private handleMessage(ev: { data: unknown }): void {
+    if (!this.open) return;
     const data = ev.data;
-
     if (data instanceof ArrayBuffer) {
       this.decodeAndDispatch(new Uint8Array(data));
       return;
@@ -331,73 +286,41 @@ export class WebSocketTransport implements Transport {
     try {
       packet = Packet.decodeExact(bytes, this.limits);
     } catch (e) {
-      // STRICT: an undecodable or over-limit frame means the peer and this
-      // client no longer agree on the protocol — the stream is not
-      // trustworthy, so the connection closes (matching Rust 2.0's default
-      // FramePolicy). The old behavior reported the error and kept reading.
+      // STRICT: a desynchronized peer is not trustworthy.
       this.fatal(e);
       return;
     }
-    for (const cb of this.messageHandlers) {
+    for (const o of [...this.observers]) {
       try {
-        cb(packet);
+        o.onMessage?.(packet);
       } catch (e) {
         this.dispatchError(e);
       }
     }
   }
 
-  /** Report a protocol violation and close: strict framing has no
-   *  keep-going path. */
   private fatal(e: unknown): void {
     this.dispatchError(e);
-    void this.close();
-  }
-
-  private handleError(ev: unknown): void {
-    this.dispatchError(ev);
-    if (this._state === TransportState.Connecting) {
-      // A handshake error is TERMINAL for this attempt, whether or not the
-      // platform ever follows up with onclose: reject the pending connect,
-      // detach the socket and land in Closed — the old behavior stayed in
-      // Connecting and handed every later connect() the same rejected
-      // promise.
-      const reject = this.connectReject;
-      this.connectResolve = null;
-      this.connectReject = null;
-      reject?.(ev instanceof Error ? ev : new TransportError('WebSocket error'));
-      this.ws = null;
-      this.handleClose({ reason: 'error during connect' });
-    }
+    void this.close({ reason: 'protocol violation', cause: e });
   }
 
   private handleClose(ev: unknown): void {
-    // Idempotent: the close path can be driven twice — once synthetically
-    // by a send() that failed on a dead socket, once by the socket's own
-    // (lagging) onclose. Consumers must see close exactly once, otherwise
-    // e.g. a reconnect state machine schedules two reconnect cycles.
-    if (this._state === TransportState.Closed) return;
-    const wasConnecting = this._state === TransportState.Connecting;
-    this._state = TransportState.Closed;
-    for (const cb of this.closeHandlers) {
+    if (!this.open) return;
+    this.open = false;
+    for (const o of [...this.observers]) {
       try {
-        cb(ev);
+        o.onClose?.(ev);
       } catch {
         /* swallow */
       }
     }
-    if (wasConnecting && this.connectReject) {
-      const reject = this.connectReject;
-      this.connectResolve = null;
-      this.connectReject = null;
-      reject(new TransportError('connection closed before open'));
-    }
   }
 
   private dispatchError(e: unknown): void {
-    for (const cb of this.errorHandlers) {
+    if (!this.open) return;
+    for (const o of [...this.observers]) {
       try {
-        cb(e);
+        o.onError?.(e);
       } catch {
         /* swallow */
       }

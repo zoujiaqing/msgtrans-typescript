@@ -4,18 +4,18 @@ import {
   Packet,
   ReservedFlag,
 } from './packet.js';
-import { FIXED_HEADER_LEN } from './constants.js';
 import { DecodeLimitError, TransportError, WireFormatError } from './errors.js';
-import {
-  type EnqueuedInfo,
-  type Transport,
-  TransportState,
+import type {
+  ConnectOptions,
+  EnqueuedInfo,
+  TransportConnector,
+  TransportObserver,
+  TransportSession,
 } from './transport.js';
+import { FIXED_HEADER_LEN } from './constants.js';
 
-/**
- * The subset of the WebTransport API this adapter needs — injectable so
- * tests (and non-browser hosts) can supply a fake.
- */
+/** The subset of the WebTransport API this adapter needs — injectable so
+ *  tests (and non-browser hosts) can supply a fake. */
 export interface WebTransportLike {
   readonly ready: Promise<void>;
   readonly closed: Promise<unknown>;
@@ -28,7 +28,7 @@ export interface WebTransportLike {
 
 export type WebTransportFactory = (url: string) => WebTransportLike;
 
-export interface WebTransportTransportOptions {
+export interface WebTransportConnectorOptions {
   /** https:// URL of the WebTransport endpoint. */
   url: string;
   /** Override the WebTransport constructor. Defaults to
@@ -42,180 +42,119 @@ export interface WebTransportTransportOptions {
 const LEN_PREFIX = 4;
 
 /**
- * msgtrans over WebTransport (HTTP/3).
- *
- * Framing mirrors the Rust QUIC adapter so the two can interoperate the day
- * a server exposes a WebTransport endpoint: ONE bidirectional stream per
- * connection, each msgtrans frame preceded by a 4-byte big-endian length.
- * The stream is a byte stream (unlike WebSocket's message framing), so this
- * adapter owns reassembly: partial prefixes, partial frames and multiple
- * frames per chunk are all normal.
- *
- * Semantics match the WebSocket adapter exactly:
- * - `send()` resolves when the chunk was ACCEPTED by the stream writer
- *   (enqueue-confirmed; the writer's promise is the platform's own
- *   backpressure, so no separate high-water mark is layered on top).
- * - Strict inbound: an over-limit length prefix or an undecodable frame
- *   closes the connection.
- * - `ReservedFlag.Fragmented` is refused (nothing implements reassembly).
- * - Generation isolation: a previous session's late readable/closed events
- *   cannot act on the replacement connection.
+ * WebTransport connector (EXPERIMENTAL): configuration only. Each connect
+ * dials a fresh HTTP/3 session and returns a `WebTransportSession` that owns
+ * it. Framing mirrors the Rust QUIC adapter — one bidirectional stream,
+ * 4-byte big-endian length prefix per msgtrans frame.
  */
-export class WebTransportTransport implements Transport {
-  private readonly opts: WebTransportTransportOptions;
+export class WebTransportConnector implements TransportConnector {
+  private readonly opts: WebTransportConnectorOptions;
   private readonly limits: DecodeLimits;
-  private session: WebTransportLike | null = null;
-  private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private _state: TransportState = TransportState.Idle;
-  private readonly messageHandlers: Array<(p: Packet) => void> = [];
-  private readonly messageEnqueuedHandlers: Array<(info: EnqueuedInfo) => void> =
-    [];
-  private readonly closeHandlers: Array<(ev?: unknown) => void> = [];
-  private readonly errorHandlers: Array<(e: unknown) => void> = [];
 
-  constructor(opts: WebTransportTransportOptions) {
+  constructor(opts: WebTransportConnectorOptions) {
     this.opts = opts;
     this.limits = normalizeDecodeLimits(opts.limits);
   }
 
-  get state(): TransportState {
-    return this._state;
-  }
-
-  isConnected(): boolean {
-    return this._state === TransportState.Open;
-  }
-
-  async connect(): Promise<void> {
-    if (this._state === TransportState.Open) return;
-    if (
-      this._state !== TransportState.Idle &&
-      this._state !== TransportState.Closed
-    ) {
-      throw new TransportError(`cannot connect in state ${this._state}`);
-    }
-    this._state = TransportState.Connecting;
-
+  async connect(options: ConnectOptions): Promise<TransportSession> {
+    const { signal } = options;
+    if (signal.aborted) throw new TransportError('connect aborted');
     const factory =
       this.opts.webTransportFactory ?? defaultWebTransportFactory;
-    // CANCEL SAFETY: `session` starts null so a factory that throws
-    // synchronously still lands in a catch that resets the state machine —
-    // the old shape left `session` unassigned and the state wedged in
-    // Connecting, refusing every retry.
-    let session: WebTransportLike | null = null;
+    const wt = factory(this.opts.url);
+    const abortDial = () => {
+      try {
+        wt.close();
+      } catch {
+        /* already dead */
+      }
+    };
+    signal.addEventListener('abort', abortDial);
     try {
-      session = factory(this.opts.url);
-      this.session = session;
-      await session.ready;
-      const stream = await session.createBidirectionalStream();
-      // A close() during the awaits nulls `this.session`; a competing
-      // connect replaces it. Either way THIS attempt must fail, not
-      // report success on a connection that is already gone.
-      if (this.session !== session) {
-        throw new TransportError('connection superseded during connect');
+      await wt.ready;
+      const stream = await wt.createBidirectionalStream();
+      if (signal.aborted) {
+        // Cancel AND release the connection the dial won.
+        abortDial();
+        throw new TransportError('connect aborted');
       }
-      this.writer = stream.writable.getWriter();
-      this._state = TransportState.Open;
-
-      // GENERATION ISOLATION: both long-lived loops close over THEIR
-      // session and check it is still current before acting — the
-      // WebTransport twin of the WebSocket adapter's socket guard.
-      const isCurrent = () => this.session === session;
-      void this.readLoop(stream.readable, isCurrent);
-      void session.closed.then(
-        (info) => {
-          if (isCurrent()) this.handleClose(info);
-        },
-        (e) => {
-          if (isCurrent()) {
-            this.dispatchError(e);
-            this.handleClose(e);
-          }
-        },
-      );
+      return new WebTransportSession(wt, stream, this.limits);
     } catch (e) {
-      if (session === null || this.session === session) {
-        this._state = TransportState.Closed;
-        this.session = null;
-        this.writer = null;
-      }
-      throw e;
+      abortDial();
+      throw e instanceof Error ? e : new TransportError(String(e));
+    } finally {
+      signal.removeEventListener('abort', abortDial);
     }
   }
+}
 
-  async send(packet: Packet): Promise<void> {
-    if (this._state !== TransportState.Open || !this.writer) {
-      throw new TransportError(`cannot send in state ${this._state}`);
-    }
+/** One live WebTransport connection. */
+class WebTransportSession implements TransportSession {
+  private readonly observers: TransportObserver[] = [];
+  private readonly writer: WritableStreamDefaultWriter<Uint8Array>;
+  private open = true;
+
+  constructor(
+    private readonly wt: WebTransportLike,
+    stream: {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+    },
+    private readonly limits: DecodeLimits,
+  ) {
+    this.writer = stream.writable.getWriter();
+    void this.readLoop(stream.readable);
+    void wt.closed.then(
+      (info) => this.handleClose(info),
+      (e) => {
+        this.dispatchError(e);
+        this.handleClose(e);
+      },
+    );
+  }
+
+  isOpen(): boolean {
+    return this.open;
+  }
+
+  async enqueue(packet: Packet): Promise<EnqueuedInfo> {
+    if (!this.open) throw new TransportError('session is closed');
     if (packet.hasFlag(ReservedFlag.Fragmented)) {
       throw new WireFormatError(
         'ReservedFlag.Fragmented is not supported over WebTransport transport',
       );
     }
-    // Encode failures are the caller's packet problem, never the
-    // connection's.
     const bytes = packet.encode(this.limits);
     const framed = new Uint8Array(LEN_PREFIX + bytes.length);
     new DataView(framed.buffer).setUint32(0, bytes.length, false);
     framed.set(bytes, LEN_PREFIX);
-    // The writer's own promise IS the backpressure: it resolves when the
-    // chunk is accepted by the stream queue (enqueue-confirmed, the same
-    // honest tier as the WebSocket adapter).
+    // The writer's promise IS the platform's backpressure (accepted by the
+    // stream queue = enqueue-confirmed, the same honest tier as WebSocket).
     await this.writer.write(framed);
-    const info: EnqueuedInfo = { messageId: packet.messageId };
-    for (const cb of this.messageEnqueuedHandlers) {
-      try {
-        cb(info);
-      } catch {
-        /* swallow */
-      }
-    }
+    return { messageId: packet.messageId };
   }
 
-  async close(): Promise<void> {
-    if (
-      this._state === TransportState.Closed ||
-      this._state === TransportState.Idle
-    ) {
-      return;
-    }
-    this._state = TransportState.Closing;
-    // Detach BEFORE closing: an in-flight connect() sees `this.session`
-    // change and fails its supersession check instead of opening a
-    // connection the caller just closed.
-    const session = this.session;
-    this.session = null;
+  subscribe(observer: TransportObserver): () => void {
+    this.observers.push(observer);
+    return () => {
+      const i = this.observers.indexOf(observer);
+      if (i >= 0) this.observers.splice(i, 1);
+    };
+  }
+
+  close(reason?: unknown): Promise<void> {
+    if (!this.open) return Promise.resolve();
     try {
-      session?.close();
+      this.wt.close();
     } catch {
-      /* the deterministic close below still runs */
+      /* deterministic close below still runs */
     }
-    // The definitive Closed transition arrives via the `closed` promise
-    // handler (or has already run); force it if the platform never settles.
-    this.handleClose({ reason: 'closed locally' });
+    this.handleClose(reason ?? { reason: 'closed locally' });
+    return Promise.resolve();
   }
 
-  onMessage(cb: (packet: Packet) => void): void {
-    this.messageHandlers.push(cb);
-  }
-  onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void {
-    this.messageEnqueuedHandlers.push(cb);
-  }
-  onClose(cb: (event?: unknown) => void): void {
-    this.closeHandlers.push(cb);
-  }
-  onError(cb: (error: unknown) => void): void {
-    this.errorHandlers.push(cb);
-  }
-
-  /**
-   * Reassemble length-prefixed frames from the byte stream and dispatch
-   * strictly decoded packets. Every protocol violation is fatal.
-   */
-  private async readLoop(
-    readable: ReadableStream<Uint8Array>,
-    isCurrent: () => boolean,
-  ): Promise<void> {
+  /** Length-prefixed byte-stream reassembly; every violation is fatal. */
+  private async readLoop(readable: ReadableStream<Uint8Array>): Promise<void> {
     const reader = readable.getReader();
     const maxFrame =
       FIXED_HEADER_LEN + this.limits.maxExtHeaderLen + this.limits.maxPayloadLen;
@@ -223,7 +162,7 @@ export class WebTransportTransport implements Transport {
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (!isCurrent()) return;
+        if (!this.open) return;
         if (done) {
           this.handleClose({ reason: 'stream ended' });
           return;
@@ -236,9 +175,7 @@ export class WebTransportTransport implements Transport {
             buffer.byteOffset,
           ).getUint32(0, false);
           if (frameLen > maxFrame) {
-            // Declared length over the configured cap: refuse BEFORE
-            // buffering it (the Rust QUIC adapter's sanity check, but
-            // against the configured limits rather than a constant).
+            // Refuse BEFORE buffering it (framing-layer bomb defense).
             this.fatal(
               new DecodeLimitError(
                 `declared frame ${frameLen} > limit ${maxFrame}`,
@@ -256,9 +193,9 @@ export class WebTransportTransport implements Transport {
             this.fatal(e);
             return;
           }
-          for (const cb of this.messageHandlers) {
+          for (const o of [...this.observers]) {
             try {
-              cb(packet);
+              o.onMessage?.(packet);
             } catch (e) {
               this.dispatchError(e);
             }
@@ -266,7 +203,7 @@ export class WebTransportTransport implements Transport {
         }
       }
     } catch (e) {
-      if (isCurrent()) {
+      if (this.open) {
         this.dispatchError(e);
         this.handleClose(e);
       }
@@ -277,16 +214,15 @@ export class WebTransportTransport implements Transport {
 
   private fatal(e: unknown): void {
     this.dispatchError(e);
-    void this.close();
+    void this.close({ reason: 'protocol violation', cause: e });
   }
 
   private handleClose(ev: unknown): void {
-    if (this._state === TransportState.Closed) return;
-    this._state = TransportState.Closed;
-    this.writer = null;
-    for (const cb of this.closeHandlers) {
+    if (!this.open) return;
+    this.open = false;
+    for (const o of [...this.observers]) {
       try {
-        cb(ev);
+        o.onClose?.(ev);
       } catch {
         /* swallow */
       }
@@ -294,9 +230,10 @@ export class WebTransportTransport implements Transport {
   }
 
   private dispatchError(e: unknown): void {
-    for (const cb of this.errorHandlers) {
+    if (!this.open) return;
+    for (const o of [...this.observers]) {
       try {
-        cb(e);
+        o.onError?.(e);
       } catch {
         /* swallow */
       }

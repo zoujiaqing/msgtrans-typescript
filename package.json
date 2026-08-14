@@ -1,6 +1,6 @@
 {
   "name": "@msgtrans/client",
-  "version": "0.5.0-beta.0",
+  "version": "0.6.0-beta.0",
   "description": "TypeScript client runtime for the msgtrans wire protocol \u2014 browser-first; WebSocket transport, zlib compression, heartbeat/reconnect helpers, experimental WebTransport.",
   "type": "module",
   "main": "./dist/index.js",

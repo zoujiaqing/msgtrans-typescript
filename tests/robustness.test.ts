@@ -11,7 +11,7 @@ import {
   TransportClient,
   TransportError,
   TransportState,
-  WebSocketTransport,
+  WebSocketConnector,
   type WebSocketLike,
 } from '../src/index.js';
 import { FakeTransport, flush } from './fake-transport.js';
@@ -49,16 +49,29 @@ class MockWebSocket implements WebSocketLike {
 async function openTransport(
   mock: MockWebSocket,
   maxBufferedBytes?: number,
-): Promise<WebSocketTransport> {
-  const t = new WebSocketTransport({
+) {
+  const connector = new WebSocketConnector({
     url: 'ws://test.invalid',
     webSocketFactory: () => mock,
     ...(maxBufferedBytes !== undefined ? { maxBufferedBytes } : {}),
   });
-  const p = t.connect();
+  const p = connector.connect({ signal: new AbortController().signal });
   mock.fireOpen();
-  await p;
-  return t;
+  const link = await p;
+  const closes: unknown[] = [];
+  link.subscribe({ onClose: (ev) => closes.push(ev) });
+  return Object.assign(link, {
+    closesLog: closes,
+    onClose(cb: (ev?: unknown) => void) {
+      link.subscribe({ onClose: cb });
+    },
+    send(pkt: Packet) {
+      return link.enqueue(pkt);
+    },
+    get state() {
+      return link.isOpen() ? TransportState.Open : 'closed';
+    },
+  });
 }
 
 const packet = () =>
@@ -135,7 +148,7 @@ describe('send failure on a dead socket', () => {
     m.throwOnSend = new Error('InvalidStateError: socket is closed');
 
     await expect(t.send(packet())).rejects.toThrow('socket is closed');
-    expect(t.state).toBe(TransportState.Closed); // no phantom Open
+    expect(t.isOpen()).toBe(false); // no phantom Open
     expect(closes).toHaveLength(1);
 
     // The real (lagging) onclose arrives later — must be a no-op.

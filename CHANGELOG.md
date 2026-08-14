@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.6.0-beta.0 — 2026-08-14
+
+**The Connector/Session SPI** (eighth review). The shared reconnectable
+`Transport` object is gone from the public boundary: a `TransportConnector`
+holds configuration only, and every `connect()` returns a brand-new
+`TransportSession` that OWNS its physical connection, writer and event
+source. The reviewer's four counterexamples — an old connection's late
+same-id Response completing the new connection's request, an async send
+writing into the replacement socket, a dial installing a session after
+disconnect(), a late onopen reviving a closed state machine — are now
+unrepresentable rather than guarded.
+
+### Breaking
+
+- SPI: `Transport` → `TransportConnector` + `TransportSession` +
+  `TransportObserver`. `connect({signal})` is abortable and MUST release a
+  connection it wins after cancellation. Sessions enqueue/subscribe/close;
+  close is reported exactly once.
+- `WebSocketTransport` → `WebSocketConnector` (`WebSocketConnectorOptions`);
+  experimental `WebTransportTransport` → `WebTransportConnector`.
+- `TransportClient.state` is a real machine: Idle / Connecting / Open /
+  Closing / Stopped. `disconnect()` cancels an in-flight dial, awaits it,
+  retires the session, returns to Idle and emits ONE close event
+  (`intentional: true`); `shutdown()` is terminal and refuses later
+  `connect()`.
+- Requests/sends/responds bind to the session current at CALL time and
+  enqueue on that session's link — which rejects once closed.
+- `observeActivity()` is the liveness tap; `HeartbeatMonitor` uses it and
+  no longer collides with the single request consumer.
+- `CompressionCodec` takes an optional `AbortSignal`; retiring a session
+  aborts its in-flight codec work (a hung compression releases its memory).
+- SDK note: `PrivchatClient.dispose()` now calls `transport.shutdown()`
+  (terminal), and `connect()` after dispose throws.
+
 ## 0.5.0-beta.0 — 2026-08-14
 
 Session-ownership rework (seventh review). The prior claim that per-promise

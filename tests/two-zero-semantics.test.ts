@@ -15,7 +15,7 @@ import {
   TransportClient,
   UnknownWireValueError,
   UnsupportedCompressionError,
-  WebSocketTransport,
+  WebSocketConnector,
   type WebSocketLike,
   WireFormatError,
   ZlibCodec,
@@ -122,6 +122,7 @@ describe('inbound normalization', () => {
     // as-is — compressed bytes under a still-set compression flag, silently.
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
     const received: ClientMessage[] = [];
     c.on('message', (m) => received.push(m));
 
@@ -179,6 +180,7 @@ describe('inbound normalization', () => {
     // packet overtake the earlier compressed one.
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
     const order: string[] = [];
     c.on('message', (m) => order.push(decode(m.payload)));
 
@@ -198,6 +200,7 @@ describe('inbound normalization', () => {
   it('a compressed RESPONSE resolves the pending request with plaintext', async () => {
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
     const promise = c.request(text('ask'));
     await flush();
     const reqId = t.sent[0]!.messageId;
@@ -224,6 +227,7 @@ describe('outbound compression', () => {
   it('send() with Zlib puts a genuinely compressed body on the wire', async () => {
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
     const body = text('repetitive '.repeat(200));
 
     await c.send(body, { compression: CompressionType.Zlib });
@@ -245,6 +249,7 @@ describe('outbound compression', () => {
     // wire first.
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
 
     void c.send(text('a '.repeat(500)), { compression: CompressionType.Zlib });
     void c.send(text('plain'));
@@ -257,6 +262,7 @@ describe('outbound compression', () => {
   it('respond() with Zlib compresses the response body', async () => {
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
     let captured: ClientRequest | null = null;
     c.on('request', (r) => {
       captured = r;
@@ -293,6 +299,7 @@ describe('request timeout starts at enqueue', () => {
     const t = new FakeTransport();
     t.sendDelayMs = 60;
     const c = new TransportClient({ transport: t });
+    await c.connect();
 
     const promise = c.request(text('ask'), { timeoutMs: 100 });
     await new Promise((r) => setTimeout(r, 90)); // enqueue at 60, +30 into budget
@@ -312,6 +319,7 @@ describe('request timeout starts at enqueue', () => {
     const t = new FakeTransport();
     t.sendShouldFail = new Error('enqueue exploded');
     const c = new TransportClient({ transport: t });
+    await c.connect();
     await expect(c.request(text('ask'), { timeoutMs: 50 })).rejects.toThrow(
       'enqueue exploded',
     );
@@ -347,14 +355,10 @@ class GhostWS implements WebSocketLike {
   }
 }
 
-describe('WebSocket generation isolation', () => {
-  async function reconnected(): Promise<{
-    transport: WebSocketTransport;
-    old: GhostWS;
-    fresh: GhostWS;
-  }> {
+describe('WebSocket session isolation (connector model)', () => {
+  async function reconnected() {
     const sockets: GhostWS[] = [];
-    const transport = new WebSocketTransport({
+    const connector = new WebSocketConnector({
       url: 'ws://test.invalid',
       webSocketFactory: () => {
         const ws = new GhostWS();
@@ -362,53 +366,49 @@ describe('WebSocket generation isolation', () => {
         return ws;
       },
     });
-    const c1 = transport.connect();
+    const dial = () =>
+      connector.connect({ signal: new AbortController().signal });
+    const d1 = dial();
     sockets[0]!.open();
-    await c1;
-    // The connection drops and is re-established.
+    const oldLink = await d1;
+    // The connection drops and a NEW session is dialed.
     sockets[0]!.readyState = 3;
     sockets[0]!.onclose?.({ code: 1006 });
-    const c2 = transport.connect();
+    const d2 = dial();
     sockets[1]!.open();
-    await c2;
-    return { transport, old: sockets[0]!, fresh: sockets[1]! };
+    const freshLink = await d2;
+    const fresh = { received: [] as Packet[], errors: [] as unknown[], closes: [] as unknown[] };
+    freshLink.subscribe({
+      onMessage: (p) => fresh.received.push(p),
+      onError: (e) => fresh.errors.push(e),
+      onClose: (ev) => fresh.closes.push(ev),
+    });
+    return { oldLink, freshLink, fresh, old: sockets[0]! };
   }
 
-  it("an OLD socket's late onclose cannot close the replacement connection", async () => {
-    const { transport, old } = await reconnected();
-    const closes: unknown[] = [];
-    transport.onClose((ev) => closes.push(ev));
-
+  it("an OLD socket's late onclose cannot close the replacement session", async () => {
+    const { freshLink, fresh, old } = await reconnected();
     old.onclose?.({ code: 1006, reason: 'late ghost' });
-
-    expect(transport.isConnected()).toBe(true);
-    expect(closes).toHaveLength(0);
+    expect(freshLink.isOpen()).toBe(true);
+    expect(fresh.closes).toHaveLength(0);
   });
 
-  it("an OLD socket's late onmessage cannot deliver into the new generation", async () => {
-    const { transport, old } = await reconnected();
-    const delivered: Packet[] = [];
-    transport.onMessage((p) => delivered.push(p));
-
+  it("an OLD socket's late onmessage cannot deliver into the new session", async () => {
+    const { fresh, old } = await reconnected();
     const ghost = new Packet({
       packetType: PacketType.OneWay,
       messageId: 1,
       payload: text('ghost'),
     }).encode();
     old.onmessage?.({ data: ghost.buffer.slice(0) });
-
-    expect(delivered).toHaveLength(0);
+    expect(fresh.received).toHaveLength(0);
   });
 
-  it("an OLD socket's late onerror cannot poison the new generation", async () => {
-    const { transport, old } = await reconnected();
-    const errors: unknown[] = [];
-    transport.onError((e) => errors.push(e));
-
+  it("an OLD socket's late onerror cannot poison the new session", async () => {
+    const { freshLink, fresh, old } = await reconnected();
     old.onerror?.(new Error('ghost error'));
-
-    expect(errors).toHaveLength(0);
-    expect(transport.isConnected()).toBe(true);
+    expect(fresh.errors).toHaveLength(0);
+    expect(freshLink.isOpen()).toBe(true);
   });
 });
 
@@ -417,14 +417,14 @@ describe('projected backpressure', () => {
     // The old check compared only the current level, so a large frame at
     // just-under-the-mark sailed through and blew the budget.
     const ws = new GhostWS();
-    const transport = new WebSocketTransport({
+    const connector = new WebSocketConnector({
       url: 'ws://test.invalid',
       webSocketFactory: () => ws,
       maxBufferedBytes: 1024,
     });
-    const connecting = transport.connect();
+    const dialing = connector.connect({ signal: new AbortController().signal });
     ws.open();
-    await connecting;
+    const link = await dialing;
 
     ws.bufferedAmount = 1000; // under the mark on its own
     const big = new Packet({
@@ -432,32 +432,33 @@ describe('projected backpressure', () => {
       messageId: 1,
       payload: new Uint8Array(512), // projection: 1000 + 528 > 1024
     });
-    await expect(transport.send(big)).rejects.toBeInstanceOf(BackpressureError);
+    await expect(link.enqueue(big)).rejects.toBeInstanceOf(BackpressureError);
     expect(ws.sent).toHaveLength(0);
 
     ws.bufferedAmount = 100; // now the projection fits
-    await transport.send(big);
+    await link.enqueue(big);
     expect(ws.sent).toHaveLength(1);
   });
 });
 
-describe('strict inbound framing closes the connection', () => {
+describe('strict inbound framing closes the session', () => {
   it('an undecodable frame is fatal, not a logged shrug', async () => {
     const ws = new GhostWS();
-    const transport = new WebSocketTransport({
+    const connector = new WebSocketConnector({
       url: 'ws://test.invalid',
       webSocketFactory: () => ws,
     });
-    const connecting = transport.connect();
+    const dialing = connector.connect({ signal: new AbortController().signal });
     ws.open();
-    await connecting;
+    const link = await dialing;
     const errors: unknown[] = [];
-    transport.onError((e) => errors.push(e));
+    link.subscribe({ onError: (e) => errors.push(e) });
 
     const garbage = new Uint8Array([2, 9, 9, 9, 0, 0, 0, 0]); // bad version, short
     ws.onmessage?.({ data: garbage.buffer });
 
     expect(errors).toHaveLength(1);
-    expect(ws.readyState).toBe(3); // transport closed the socket
+    expect(ws.readyState).toBe(3); // session closed the socket
+    expect(link.isOpen()).toBe(false);
   });
 });

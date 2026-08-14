@@ -7,7 +7,7 @@ import {
   PacketType,
   TransportError,
   TransportState,
-  WebSocketTransport,
+  WebSocketConnector,
   type WebSocketLike,
 } from '../src/index.js';
 
@@ -87,104 +87,118 @@ class MockWebSocket implements WebSocketLike {
   }
 }
 
-function makeTransport(
+function makeConnector(
   mock: MockWebSocket,
   opts: Partial<
     Omit<
-      ConstructorParameters<typeof WebSocketTransport>[0],
+      ConstructorParameters<typeof WebSocketConnector>[0],
       'webSocketFactory' | 'url'
     >
   > = {},
-): WebSocketTransport {
-  return new WebSocketTransport({
+): WebSocketConnector {
+  return new WebSocketConnector({
     url: 'ws://test.invalid',
     webSocketFactory: () => mock,
     ...opts,
   });
 }
 
-async function connect(t: WebSocketTransport, m: MockWebSocket): Promise<void> {
-  const p = t.connect();
+const freshSignal = () => new AbortController().signal;
+
+async function openLink(t: WebSocketConnector, m: MockWebSocket) {
+  const p = t.connect({ signal: freshSignal() });
   m.fireOpen();
-  await p;
+  return await p;
 }
 
-describe('WebSocketTransport — connection lifecycle', () => {
-  it('starts in idle state', () => {
+describe('WebSocketConnector — connection lifecycle', () => {
+  it('a successful dial yields an OPEN session with arraybuffer binaryType', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    expect(t.state).toBe(TransportState.Idle);
-  });
-
-  it('transitions idle → connecting → open and sets binaryType', async () => {
-    const m = new MockWebSocket();
-    const t = makeTransport(m);
-
-    const p = t.connect();
-    expect(t.state).toBe(TransportState.Connecting);
+    const t = makeConnector(m);
+    const p = t.connect({ signal: freshSignal() });
     expect(m.binaryType).toBe('arraybuffer');
-
     m.fireOpen();
-    await p;
-    expect(t.state).toBe(TransportState.Open);
+    const link = await p;
+    expect(link.isOpen()).toBe(true);
   });
 
-  it('rejects connect if WS closes before open', async () => {
+  it('rejects the dial if WS closes before open', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    const p = t.connect();
+    const t = makeConnector(m);
+    const p = t.connect({ signal: freshSignal() });
     m.fireClose(1006, 'abnormal');
     await expect(p).rejects.toBeInstanceOf(TransportError);
-    expect(t.state).toBe(TransportState.Closed);
   });
 
-  it('returns the same promise for concurrent connect calls', async () => {
-    const m = new MockWebSocket();
-    const t = makeTransport(m);
-    const p1 = t.connect();
-    const p2 = t.connect();
-    expect(p1).toBe(p2);
-    m.fireOpen();
-    await p1;
+  it('each dial is independent: two connects yield two sessions', async () => {
+    const mocks: MockWebSocket[] = [];
+    const t = new WebSocketConnector({
+      url: 'ws://test.invalid',
+      webSocketFactory: () => {
+        const m = new MockWebSocket();
+        mocks.push(m);
+        return m;
+      },
+    });
+    const p1 = t.connect({ signal: freshSignal() });
+    const p2 = t.connect({ signal: freshSignal() });
+    mocks[0]!.fireOpen();
+    mocks[1]!.fireOpen();
+    const [l1, l2] = await Promise.all([p1, p2]);
+    expect(l1).not.toBe(l2);
+    await l1.close();
+    expect(l2.isOpen()).toBe(true); // no shared state to collapse
   });
 
-  it('close() transitions state and calls ws.close()', async () => {
+  it('an aborted dial closes the socket it was establishing', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const t = makeConnector(m);
+    const abort = new AbortController();
+    const p = t.connect({ signal: abort.signal });
+    abort.abort();
+    await expect(p).rejects.toThrow(/aborted/);
+    expect(m.closeCalls.length).toBeGreaterThan(0); // released, not leaked
+  });
 
+  it('session.close() closes the socket and reports close exactly once', async () => {
+    const m = new MockWebSocket();
+    const t = makeConnector(m);
+    const link = await openLink(t, m);
     const closes: unknown[] = [];
-    t.onClose((ev) => closes.push(ev));
+    link.subscribe({ onClose: (ev) => closes.push(ev) });
 
-    await t.close();
-    // close() resolves immediately; final state transition happens via onclose.
+    await link.close();
     expect(m.closeCalls).toHaveLength(1);
+    expect(link.isOpen()).toBe(false);
+    expect(closes).toHaveLength(1);
 
-    // Drain microtask so the queued onclose fires.
+    // The platform's own (queued) onclose fires later — must be a no-op.
     await Promise.resolve();
-    expect(t.state).toBe(TransportState.Closed);
     expect(closes).toHaveLength(1);
   });
 
   it('throws TransportError when no global WebSocket and no factory', async () => {
-    const t = new WebSocketTransport({ url: 'ws://test.invalid' });
-    await expect(t.connect()).rejects.toBeInstanceOf(TransportError);
+    const t = new WebSocketConnector({ url: 'ws://test.invalid' });
+    await expect(
+      t.connect({ signal: freshSignal() }),
+    ).rejects.toBeInstanceOf(TransportError);
   });
 });
 
-describe('WebSocketTransport — send', () => {
-  it('refuses to send before connect', async () => {
+describe('WebSocketConnector — send', () => {
+  it('refuses to enqueue on a CLOSED session (there is no pre-connect send: no session exists yet)', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await expect(t.send(Packet.oneWay(1))).rejects.toBeInstanceOf(
+    const t = makeConnector(m);
+    const link = await openLink(t, m);
+    await link.close();
+    await expect(link.enqueue(Packet.oneWay(1))).rejects.toBeInstanceOf(
       TransportError,
     );
   });
 
   it('writes Packet.encode() bytes verbatim', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const packet = new Packet({
       packetType: PacketType.OneWay,
@@ -193,32 +207,30 @@ describe('WebSocketTransport — send', () => {
       payload: new TextEncoder().encode('hello world'),
     });
 
-    await t.send(packet);
+    await link.enqueue(packet);
     expect(m.sent).toHaveLength(1);
     expect(Array.from(m.sent[0]!)).toEqual(Array.from(packet.encode()));
   });
 
   it('emits identical bytes as Rust fixture 02_oneway_text', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const fixture = readFixture('02_oneway_text.bin');
     const packet = Packet.decodeExact(fixture);
-    await t.send(packet);
+    await link.enqueue(packet);
 
     expect(Array.from(m.sent[0]!)).toEqual(Array.from(fixture));
   });
 });
 
-describe('WebSocketTransport — receive', () => {
+describe('WebSocketConnector — receive', () => {
   it('decodes ArrayBuffer message frames into Packet via onMessage', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const received: Packet[] = [];
-    t.onMessage((p) => received.push(p));
+    link.subscribe({ onMessage: (p) => received.push(p) });
 
     const fixture = readFixture('03_request_minimal.bin');
     m.fireBinary(fixture);
@@ -232,11 +244,10 @@ describe('WebSocketTransport — receive', () => {
 
   it('also accepts ArrayBufferView (Buffer-like) frames', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const received: Packet[] = [];
-    t.onMessage((p) => received.push(p));
+    link.subscribe({ onMessage: (p) => received.push(p) });
 
     const fixture = readFixture('04_response_matching.bin');
     m.fireBinaryAsView(fixture);
@@ -248,13 +259,12 @@ describe('WebSocketTransport — receive', () => {
 
   it('routes malformed binary to onError', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const errors: unknown[] = [];
     const messages: Packet[] = [];
-    t.onError((e) => errors.push(e));
-    t.onMessage((p) => messages.push(p));
+    link.subscribe({ onError: (e) => errors.push(e) });
+    link.subscribe({ onMessage: (p) => messages.push(p) });
 
     m.fireBinary(new Uint8Array([0x02, 0x00, 0x00, 0x00])); // version=2 → unsupported
 
@@ -263,14 +273,13 @@ describe('WebSocketTransport — receive', () => {
   });
 });
 
-describe('WebSocketTransport — text frame policy', () => {
+describe('WebSocketConnector — text frame policy', () => {
   it('routes text to onError by default', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const errors: unknown[] = [];
-    t.onError((e) => errors.push(e));
+    link.subscribe({ onError: (e) => errors.push(e) });
     m.fireText('hello');
 
     expect(errors).toHaveLength(1);
@@ -279,13 +288,12 @@ describe('WebSocketTransport — text frame policy', () => {
 
   it('silently drops text when onTextFrame=ignore', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m, { onTextFrame: 'ignore' });
-    await connect(t, m);
+    const link = await openLink(makeConnector(m, { onTextFrame: 'ignore' }), m);
 
     const errors: unknown[] = [];
     const messages: Packet[] = [];
-    t.onError((e) => errors.push(e));
-    t.onMessage((p) => messages.push(p));
+    link.subscribe({ onError: (e) => errors.push(e) });
+    link.subscribe({ onMessage: (p) => messages.push(p) });
     m.fireText('hello');
 
     expect(errors).toHaveLength(0);
@@ -293,28 +301,26 @@ describe('WebSocketTransport — text frame policy', () => {
   });
 });
 
-describe('WebSocketTransport — close + error events', () => {
+describe('WebSocketConnector — close + error events', () => {
   it('triggers onClose with the underlying close event', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const closes: unknown[] = [];
-    t.onClose((ev) => closes.push(ev));
+    link.subscribe({ onClose: (ev) => closes.push(ev) });
     m.fireClose(1001, 'going away');
 
     expect(closes).toHaveLength(1);
-    expect(t.state).toBe(TransportState.Closed);
+    expect(link.isOpen()).toBe(false);
     expect(closes[0]).toMatchObject({ code: 1001, reason: 'going away' });
   });
 
   it('triggers onError on socket error', async () => {
     const m = new MockWebSocket();
-    const t = makeTransport(m);
-    await connect(t, m);
+    const link = await openLink(makeConnector(m), m);
 
     const errors: unknown[] = [];
-    t.onError((e) => errors.push(e));
+    link.subscribe({ onError: (e) => errors.push(e) });
     m.fireError({ message: 'boom' });
 
     expect(errors).toHaveLength(1);

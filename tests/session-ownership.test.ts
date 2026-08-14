@@ -13,14 +13,16 @@ import {
   ReconnectManager,
   TransportClient,
   TransportState,
-  WebSocketTransport,
+  WebSocketConnector,
   type CompressionCodec,
+  type ConnectOptions,
   type EnqueuedInfo,
-  type Transport,
+  type TransportConnector,
+  type TransportSession,
   type WebSocketLike,
 } from '../src/index.js';
 import * as rootApi from '../src/index.js';
-import { FakeTransport, flush, until } from './fake-transport.js';
+import { FakeSession, FakeTransport, flush, until } from './fake-transport.js';
 
 const text = (s: string) => new TextEncoder().encode(s);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -86,10 +88,10 @@ describe('P0-2: concurrent connect() is single-flight', () => {
   class SlowConnectTransport extends FakeTransport {
     connectStarts = 0;
     private release: Array<() => void> = [];
-    override async connect(): Promise<void> {
+    override async connect(options: ConnectOptions): Promise<TransportSession> {
       this.connectStarts += 1;
       await new Promise<void>((r) => this.release.push(r));
-      await super.connect();
+      return super.connect(options);
     }
     finishOne(): void {
       this.release.shift()?.();
@@ -119,13 +121,16 @@ describe('P0-2: concurrent connect() is single-flight', () => {
 });
 
 describe('P0-3: ownership does not depend on the adapter firing close', () => {
-  /** A transport whose close() NEVER emits an onClose event. */
+  /** A connector whose sessions NEVER report their close — the SPI abuse
+   *  the old generation counter silently depended on. */
   class SilentCloseTransport extends FakeTransport {
-    override async close(): Promise<void> {
-      // state flips, but no close event reaches the client — the SPI abuse
-      // the generation counter silently depended on.
-      (this as unknown as { _isConnected: boolean })._isConnected = false;
-      this.closeCalls.push(Date.now());
+    override async connect(options: ConnectOptions): Promise<TransportSession> {
+      const session = (await super.connect(options)) as FakeSession;
+      session.close = () => {
+        // flips nothing observable: no observer notification at all
+        return Promise.resolve();
+      };
+      return session;
     }
   }
 
@@ -158,7 +163,7 @@ describe('P0-3: ownership does not depend on the adapter firing close', () => {
   });
 });
 
-describe('P0-4: WebSocket state cannot be revived by late events', () => {
+describe('P0-4: WebSocket dial cannot be revived by late events', () => {
   class ManualWS implements WebSocketLike {
     binaryType = 'blob';
     readyState = 0;
@@ -173,25 +178,25 @@ describe('P0-4: WebSocket state cannot be revived by late events', () => {
     }
   }
 
-  it('a late onopen after close-during-Connecting cannot reopen the transport', async () => {
+  it('a late onopen after an aborted dial cannot mint a session', async () => {
     const ws = new ManualWS();
-    const transport = new WebSocketTransport({
+    const connector = new WebSocketConnector({
       url: 'ws://test.invalid',
       webSocketFactory: () => ws,
     });
-    const connecting = transport.connect().catch(() => {});
-    await transport.close();
-    // The platform's late onopen arrives AFTER the deterministic close.
+    const abort = new AbortController();
+    const dialing = connector.connect({ signal: abort.signal });
+    abort.abort();
+    // The platform's late onopen arrives AFTER the abort — the handler was
+    // detached, so nothing can resolve the dial with a live session.
     ws.readyState = 1;
     ws.onopen?.({});
-    await connecting;
-    expect(transport.state).toBe(TransportState.Closed);
-    expect(transport.isConnected()).toBe(false);
+    await expect(dialing).rejects.toThrow(/aborted/);
   });
 
-  it('onerror without onclose does not wedge Connecting (a fresh connect gets a fresh dial)', async () => {
+  it('onerror without onclose does not wedge anything (a fresh connect gets a fresh dial)', async () => {
     const sockets: ManualWS[] = [];
-    const transport = new WebSocketTransport({
+    const connector = new WebSocketConnector({
       url: 'ws://test.invalid',
       webSocketFactory: () => {
         const ws = new ManualWS();
@@ -199,17 +204,18 @@ describe('P0-4: WebSocket state cannot be revived by late events', () => {
         return ws;
       },
     });
-    const first = transport.connect();
+    const signal = () => new AbortController().signal;
+    const first = connector.connect({ signal: signal() });
     sockets[0]!.onerror?.(new Error('handshake refused'));
     await expect(first).rejects.toThrow();
-    // Pre-fix: state stayed Connecting and every later connect() was handed
-    // back the SAME rejected promise.
-    const second = transport.connect();
+    // Connector model: there IS no shared state to wedge — each dial is
+    // independent by construction.
+    const second = connector.connect({ signal: signal() });
     expect(sockets).toHaveLength(2);
     sockets[1]!.readyState = 1;
     sockets[1]!.onopen?.({});
-    await second;
-    expect(transport.isConnected()).toBe(true);
+    const link = await second;
+    expect(link.isOpen()).toBe(true);
   });
 });
 
@@ -332,7 +338,7 @@ describe('P1: strict config validation is complete', () => {
     ).toThrow();
     expect(
       () =>
-        new WebSocketTransport({ url: 'ws://x', maxBufferedBytes: -1 }),
+        new WebSocketConnector({ url: 'ws://x', maxBufferedBytes: -1 }),
     ).toThrow();
     const c = new TransportClient({ transport: new FakeTransport() });
     void expect(c.request(text('x'), { timeoutMs: -5 })).rejects.toThrow();
@@ -348,6 +354,7 @@ describe('P1: handles are interfaces; requests have ONE consumer', () => {
   it('handles carry a kind discriminant', async () => {
     const t = new FakeTransport();
     const c = new TransportClient({ transport: t });
+    await c.connect();
     const kinds: string[] = [];
     c.on('message', (m) => kinds.push(m.kind));
     c.on('request', (r) => kinds.push(r.kind));
@@ -407,4 +414,5 @@ describe('P2: queue caps are byte-aware on both directions', () => {
 });
 
 // Referenced to keep the imports honest.
-void ((): Transport | EnqueuedInfo | null => null);
+void ((): TransportConnector | EnqueuedInfo | null => null);
+void TransportState;

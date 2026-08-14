@@ -12,8 +12,12 @@ import {
 } from '../src/index.js';
 import { FakeTransport, flush } from './fake-transport.js';
 
-function newClient(transport: FakeTransport): TransportClient {
-  return new TransportClient({ transport });
+async function newClient(transport: FakeTransport): Promise<TransportClient> {
+  // Connector model: no session exists until connect() — a client that never
+  // connected cannot send or receive, so these behavior tests connect first.
+  const c = new TransportClient({ transport });
+  await c.connect();
+  return c;
 }
 
 function makeOneWayInbound(payload = 'hi', bizType = 0): Packet {
@@ -37,7 +41,7 @@ function makeRequestInbound(messageId: number, bizType = 7): Packet {
 describe('TransportClient — lifecycle', () => {
   it('connect/close pass through to transport', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = new TransportClient({ transport: t });
     await c.connect();
     expect(t.connectCalls).toHaveLength(1);
     await c.disconnect();
@@ -59,7 +63,7 @@ describe('TransportClient — lifecycle', () => {
 describe('TransportClient — send / request convenience methods', () => {
   it('send() builds a OneWay packet with payload + bizType', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.send(new TextEncoder().encode('hello'), { bizType: 5 });
 
     expect(t.sent).toHaveLength(1);
@@ -72,7 +76,7 @@ describe('TransportClient — send / request convenience methods', () => {
 
   it('request() returns the response payload bytes', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
 
     const promise = c.request(new TextEncoder().encode('ping'), {
       bizType: 100,
@@ -112,7 +116,7 @@ describe('TransportClient — send / request convenience methods', () => {
 describe('TransportClient — message routing', () => {
   it('OneWay packets surface via on("message") as ClientMessage', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const received: ClientMessage[] = [];
     c.on('message', (msg) => received.push(msg));
 
@@ -129,7 +133,7 @@ describe('TransportClient — message routing', () => {
 
   it('Response packets matching pending request do NOT trigger message event', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const received: ClientMessage[] = [];
     c.on('message', (msg) => received.push(msg));
 
@@ -151,7 +155,7 @@ describe('TransportClient — message routing', () => {
 
   it('Response with unknown messageId is DROPPED (reported via error channel, never as message)', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const received: ClientMessage[] = [];
     const errors: unknown[] = [];
     c.on('message', (msg) => received.push(msg));
@@ -172,7 +176,7 @@ describe('TransportClient — message routing', () => {
 
   it('Request packets surface via on("request") as ClientRequest, NOT via on("message")', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const messages: ClientMessage[] = [];
     const requests: ClientRequest[] = [];
     c.on('message', (m) => messages.push(m));
@@ -199,7 +203,7 @@ describe('TransportClient — message routing', () => {
 
   it('respond() can override bizType', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     let captured: ClientRequest | null = null;
     c.on('request', (r) => {
       captured = r;
@@ -212,7 +216,7 @@ describe('TransportClient — message routing', () => {
 
   it('a OneWay has no respond() at all (typed split, not a runtime check)', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     let captured: ClientMessage | null = null;
     c.on('message', (m) => {
       captured = m;
@@ -227,7 +231,7 @@ describe('TransportClient — message routing', () => {
 
   it('respond() rejects when called twice', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     let captured: ClientRequest | null = null;
     c.on('request', (r) => {
       captured = r;
@@ -246,7 +250,7 @@ describe('TransportClient — message routing', () => {
     // server-side request that drew the same id — the cross-generation leak
     // Rust 2.0 closed with generation-bound claims.
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     let captured: ClientRequest | null = null;
     c.on('request', (r) => {
       captured = r;
@@ -257,26 +261,29 @@ describe('TransportClient — message routing', () => {
     t.fireClose(); // connection turns over
     await c.connect(); // new generation
 
+    // Connector model: the respond lands on the OLD session's link, which
+    // is closed — refusal is structural ('session is closed'), not a
+    // generation comparison someone had to remember.
     await expect(captured!.respond(new Uint8Array())).rejects.toThrow(
-      /connection changed/,
+      /session is closed|connection changed/,
     );
     expect(t.sent).toHaveLength(0); // nothing reached the wire
   });
 });
 
 describe('TransportClient — close / error events', () => {
-  it('close event propagates to listeners', () => {
+  it('close event propagates to listeners', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const closes: unknown[] = [];
     c.on('close', (ev) => closes.push(ev));
     t.fireClose({ code: 1001 });
     expect(closes).toEqual([{ code: 1001 }]);
   });
 
-  it('error event propagates to listeners', () => {
+  it('error event propagates to listeners', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const errors: unknown[] = [];
     c.on('error', (e) => errors.push(e));
     const boom = new Error('boom');
@@ -286,7 +293,7 @@ describe('TransportClient — close / error events', () => {
 
   it('on() returns an unsubscribe function', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     const received: ClientMessage[] = [];
     const off = c.on('message', (m) => received.push(m));
 
@@ -304,16 +311,16 @@ describe('TransportClient — close / error events', () => {
 describe('TransportClient — Rust-compat surface', () => {
   it('disconnect() is an alias for close()', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
     await c.disconnect();
     expect(t.closeCalls).toHaveLength(1);
   });
 
-  it('isConnected() reflects underlying transport state', async () => {
+  it('isConnected() reflects the session lifecycle', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
-    expect(c.isConnected()).toBe(false);
+    const c = new TransportClient({ transport: t });
+    expect(c.isConnected()).toBe(false); // no session before connect
 
     await c.connect();
     expect(c.isConnected()).toBe(true);
@@ -324,7 +331,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('messageEnqueued fires after each accepted send (honest tier: enqueue, not write)', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
 
     const enqueued: number[] = [];
@@ -338,7 +345,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('messageEnqueued fires for the Request portion of request()', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
 
     const enqueued: number[] = [];
@@ -360,7 +367,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('on("messageEnqueued") returns an unsubscribe function', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
 
     const enqueued: number[] = [];
@@ -375,7 +382,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('SendOptions.extHeader is propagated onto the wire packet', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
 
     const ext = new TextEncoder().encode('route:msg');
@@ -392,7 +399,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('respond() propagates extHeader', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     let captured: ClientRequest | null = null;
     c.on('request', (r) => {
       captured = r;
@@ -411,7 +418,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('SendOptions.compression=None is allowed and reaches the packet', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
 
     await c.send(new TextEncoder().encode('p'), {
@@ -422,7 +429,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('send() rejects with UnsupportedCompressionError for an unregistered codec (Zstd)', async () => {
     const t = new FakeTransport();
-    const c = newClient(t);
+    const c = await newClient(t);
     await c.connect();
 
     await expect(

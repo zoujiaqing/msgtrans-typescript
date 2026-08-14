@@ -4,13 +4,13 @@ TypeScript client runtime for the [msgtrans](https://github.com/zoujiaqing/msgtr
 
 `@msgtrans/client` is the language mapping of the `msgtrans` Rust client surface — same Packet semantics, same Request/Response correlation rules, same wire bytes. The wire format is defined by [`WIRE_FORMAT.md`](https://github.com/zoujiaqing/msgtrans/blob/main/docs/WIRE_FORMAT.md) and conformance is verified by a shared cross-language fixture suite.
 
-> **Status: 0.5.0-beta.0** — 2.0 semantic alignment + session-ownership lifecycle: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
+> **Status: 0.6.0-beta.0** — Connector/Session SPI: per-connection ownership at the public boundary: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
 >
 > **Compatibility matrix**
 >
 > | @msgtrans/client | msgtrans (Rust) | Wire protocol |
 > |---|---|---|
-> | 0.2.x – 0.5.x | 2.0.x | v1 |
+> | 0.2.x – 0.6.x | 2.0.x | v1 |
 > | 0.1.x | 1.0.x / 2.0.x | v1 |
 >
 > The version numbers deliberately do NOT lock step with the Rust crate: this is a browser, single-connection client, not a full mapping of the Rust server architecture. What IS aligned: the wire format, the request lifecycle, strict decoding, and the error semantics.

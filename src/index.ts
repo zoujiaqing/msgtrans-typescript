@@ -9,16 +9,22 @@ export {
 export type { PacketInit, DecodeLimits } from './packet.js';
 
 export { TransportState } from './transport.js';
-export type { Transport, EnqueuedInfo } from './transport.js';
+export type {
+  ConnectOptions,
+  EnqueuedInfo,
+  TransportConnector,
+  TransportObserver,
+  TransportSession,
+} from './transport.js';
 
 export {
-  WebSocketTransport,
+  WebSocketConnector,
   DEFAULT_MAX_BUFFERED_BYTES,
 } from './websocket-transport.js';
 export type {
   WebSocketLike,
   WebSocketFactory,
-  WebSocketTransportOptions,
+  WebSocketConnectorOptions,
   TextFramePolicy,
 } from './websocket-transport.js';
 

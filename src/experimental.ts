@@ -4,9 +4,9 @@
 // run interop E2E against: the framing mirrors the Rust QUIC adapter by
 // construction, but a contract nobody has exercised across the wire is a
 // candidate, not a promise. Root-API stability rules do not apply.
-export { WebTransportTransport } from './webtransport-transport.js';
+export { WebTransportConnector } from './webtransport-transport.js';
 export type {
   WebTransportLike,
   WebTransportFactory,
-  WebTransportTransportOptions,
+  WebTransportConnectorOptions,
 } from './webtransport-transport.js';

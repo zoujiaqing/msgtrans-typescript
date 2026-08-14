@@ -82,14 +82,14 @@ export class HeartbeatMonitor {
     this.epoch += 1; // a fresh lifecycle owns a fresh probing flag
     this.probing = false;
     this.lastActivity = Date.now();
-    const bump = () => {
-      this.lastActivity = Date.now();
-    };
-    // Traffic in either direction is proof of life.
+    // Traffic in either direction is proof of life — via the dedicated
+    // activity tap, which is multi-subscriber. Subscribing to `request`
+    // here would occupy the SINGLE request-consumer slot and collide with
+    // the application's handler (whichever registered second threw).
     this.unsubscribes.push(
-      this.client.on('message', bump),
-      this.client.on('request', bump),
-      this.client.on('messageEnqueued', bump),
+      this.client.observeActivity(() => {
+        this.lastActivity = Date.now();
+      }),
     );
     // The tick is a cheap idle check, not the probe itself; scheduling at
     // a fraction of the interval bounds probe latency to ~interval*1.25

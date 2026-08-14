@@ -48,6 +48,7 @@ export class InboundNormalizer {
       maxFrames: 8192,
       maxBytes: 64 * 1024 * 1024,
     },
+    private readonly signal?: AbortSignal,
   ) {}
 
   push(
@@ -118,6 +119,7 @@ export class InboundNormalizer {
     packet.payload = await codec.decompress(
       packet.payload,
       this.limits.maxPayloadLen,
+      this.signal,
     );
     // Clear the flag it acted on: the header must not still claim a
     // compression that was undone.

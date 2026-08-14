@@ -8,7 +8,12 @@ import {
 import { QueueOverflowError, TransportError } from './errors.js';
 import { CodecRegistry, type CompressionCodec, ZlibCodec } from './codec.js';
 import { InboundNormalizer } from './inbound-normalizer.js';
-import type { EnqueuedInfo, Transport } from './transport.js';
+import {
+  type EnqueuedInfo,
+  type TransportConnector,
+  type TransportSession,
+  TransportState,
+} from './transport.js';
 import { RequestManager } from './request-manager.js';
 import {
   requireCount,
@@ -16,7 +21,7 @@ import {
   requireNonNegativeFinite,
 } from './validate.js';
 import {
-  WebSocketTransport,
+  WebSocketConnector,
   type TextFramePolicy,
   type WebSocketFactory,
 } from './websocket-transport.js';
@@ -26,9 +31,9 @@ export interface SendOptions {
   extHeader?: Uint8Array;
   /**
    * Compression algorithm. The registered codec is applied on THIS side
-   * before enqueue; if no codec is registered for the algorithm the send
-   * rejects — a raw payload is never shipped under a compressed header.
-   * `ZlibCodec` is registered by default; Zstd is injectable via
+   * before enqueue; no codec for the algorithm rejects the send — a raw
+   * payload is never shipped under a compressed header. `ZlibCodec` is
+   * registered by default; Zstd is injectable via
    * `TransportClientOptions.codecs`.
    */
   compression?: CompressionType;
@@ -41,61 +46,35 @@ export interface RequestOptions extends SendOptions {
 
 export interface TransportClientOptions {
   url?: string;
-  transport?: 'websocket' | Transport;
+  /** A custom connection factory; defaults to `WebSocketConnector` built
+   *  from `url` + the WebSocket options below. */
+  transport?: 'websocket' | TransportConnector;
   protocols?: string | string[];
   webSocketFactory?: WebSocketFactory;
   onTextFrame?: TextFramePolicy;
   /** Outbound-buffer high-water mark; see
-   *  `WebSocketTransportOptions.maxBufferedBytes`. */
+   *  `WebSocketConnectorOptions.maxBufferedBytes`. */
   maxBufferedBytes?: number;
   defaultTimeoutMs?: number;
-  /**
-   * Frame caps, enforced in both directions (default: 16 MiB payload /
-   * 65535 ext header — the Rust 2.0 defaults, so both peers agree on what
-   * fits). Also bounds decompressed size.
-   */
+  /** Frame caps, both directions (defaults mirror Rust 2.0). */
   limits?: Partial<DecodeLimits>;
-  /**
-   * Inbound normalization queue caps (packets queued behind an in-flight
-   * decompression; bytes counted as full frame size — header + ext +
-   * payload). Overflow closes the connection: the browser cannot pause the
-   * socket, but it can refuse to buffer without limit.
-   * Defaults: 8192 frames / 64 MiB.
-   */
+  /** Inbound normalization queue caps. Defaults: 8192 frames / 64 MiB. */
   maxInboundQueueFrames?: number;
   maxInboundQueueBytes?: number;
-  /**
-   * Outbound chain caps (sends queued behind an in-flight compression), in
-   * operations AND captured payload bytes. Exceeding either rejects the
-   * send with `QueueOverflowError` — the connection stays healthy.
-   * Defaults: 8192 ops / 64 MiB.
-   */
+  /** Outbound chain caps (ops AND captured payload bytes). Defaults:
+   *  8192 / 64 MiB. Overflow rejects with `QueueOverflowError`. */
   maxOutboundQueue?: number;
   maxOutboundQueueBytes?: number;
-  /**
-   * Additional compression codecs. `ZlibCodec` (native
-   * Compression/DecompressionStream) is always registered; entries here can
-   * add Zstd or override the built-in.
-   */
+  /** Additional compression codecs (Zlib is built in). */
   codecs?: readonly CompressionCodec[];
   /**
    * Connect-time retry policy for a SINGLE `connect()` call. Default: no
-   * retry (one attempt). When running a `ReconnectManager` on top, leave
-   * this at its zero default — stacking both multiplies attempt counts and
-   * wait times; the manager is THE retry policy.
+   * retry. Leave at zero when running a `ReconnectManager` on top — the
+   * manager is THE retry policy.
    */
   connectRetry?: ConnectRetryOptions;
 }
 
-/**
- * Connect-time retry policy. Mirrors Rust `msgtrans` `RetryConfig`.
- *
- *   - `maxRetries`: number of ADDITIONAL attempts after the first one
- *     fails. Total attempts = `maxRetries + 1`. Default 0 (no retry).
- *   - `initialDelayMs`: delay before the FIRST retry. Default 100.
- *   - `maxDelayMs`: cap applied after exponential growth. Default 10_000.
- *   - `multiplier`: per-attempt backoff multiplier. Default 2.
- */
 export interface ConnectRetryOptions {
   maxRetries?: number;
   initialDelayMs?: number;
@@ -105,8 +84,7 @@ export interface ConnectRetryOptions {
 
 type ClientEvent = 'message' | 'request' | 'messageEnqueued' | 'close' | 'error';
 
-/** A one-way message delivered to the application. Always plaintext: the
- *  inbound normalizer has already undone any compression. */
+/** A one-way message delivered to the application. Always plaintext. */
 export interface ClientMessage {
   readonly kind: 'message';
   readonly payload: Uint8Array;
@@ -120,9 +98,8 @@ export interface ClientMessage {
 /**
  * A request delivered to the client that carries the obligation to answer.
  * An INTERFACE by design: the implementation is not exported, so no consumer
- * can construct one and respond with an arbitrary messageId — the forgeable
- * handle Rust 2.0 makes unrepresentable. `respond()` answers at most once,
- * and only onto the connection session it arrived on.
+ * can construct one and respond with an arbitrary messageId. `respond()`
+ * answers at most once, and only onto the session it arrived on.
  */
 export interface ClientRequest {
   readonly kind: 'request';
@@ -137,36 +114,52 @@ export interface ClientRequest {
 }
 
 /**
- * ONE connection's ownership unit — the internal mapping of Rust 2.0's
- * session: the id allocator, request registry, inbound normalizer and
- * outbound queue all belong to the session, and closing it voids every
- * piece of in-flight async work at once. Nothing here is keyed on a
- * generation NUMBER an adapter must advance by firing events: the object's
- * own identity is the generation, so an adapter that never emits `close`
- * still cannot leak old work into a replacement connection.
+ * ONE connection's client-side ownership unit, now BOUND to its
+ * `TransportSession`: the physical connection, id allocator, request
+ * registry, normalizer, outbound queue and codec abort signal all live and
+ * die together. An old session's inbound events route to ITS (closed)
+ * manager, its sends enqueue onto ITS (closed) link, and its hung codecs
+ * are aborted on retirement — there is no shared object left for stale work
+ * to leak through.
  */
-class Session {
+class ClientSession {
   readonly manager: RequestManager;
   readonly normalizer: InboundNormalizer;
+  readonly abort = new AbortController();
+  unsubscribe: (() => void) | null = null;
   outboundChain: Promise<void> = Promise.resolve();
   outboundFrames = 0;
   outboundBytes = 0;
   closed = false;
 
   constructor(
-    transport: Transport,
+    readonly link: TransportSession,
     defaultTimeoutMs: number | undefined,
     codecs: CodecRegistry,
     limits: DecodeLimits,
     inboundCaps: { maxFrames: number; maxBytes: number },
+    onEnqueued: (info: EnqueuedInfo) => void,
   ) {
-    this.manager = new RequestManager(transport, { defaultTimeoutMs });
-    this.normalizer = new InboundNormalizer(codecs, limits, inboundCaps);
+    this.manager = new RequestManager(link, { defaultTimeoutMs, onEnqueued });
+    this.normalizer = new InboundNormalizer(
+      codecs,
+      limits,
+      inboundCaps,
+      this.abort.signal,
+    );
+  }
+
+  retire(reason: TransportError): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.abort.abort(); // release hung codec work and its memory
+    this.unsubscribe?.();
+    this.manager.reset(reason);
   }
 }
 
 export class TransportClient {
-  private readonly transport: Transport;
+  private readonly connector: TransportConnector;
   private readonly limits: DecodeLimits;
   private readonly codecs: CodecRegistry;
   private readonly defaultTimeoutMs: number | undefined;
@@ -179,20 +172,18 @@ export class TransportClient {
     [];
   private readonly closeListeners: Array<(event?: unknown) => void> = [];
   private readonly errorListeners: Array<(error: unknown) => void> = [];
+  private readonly activityListeners: Array<() => void> = [];
   private readonly retryOpts: Required<ConnectRetryOptions>;
-  /** The CURRENT connection's ownership unit. Replaced atomically on every
-   *  real (re)connect; everything async captures the session it started on
-   *  and is refused once that object is no longer current. */
-  private session: Session;
-  /** Single-flight guard: concurrent `connect()` calls share one attempt,
-   *  so two completion paths can never each install a session (the id-ABA
-   *  the seventh review reproduced). */
+
+  private _state: TransportState = TransportState.Idle;
+  private session: ClientSession | null = null;
+  /** Single-flight connect + its cancellation handle. */
   private connectFlight: Promise<void> | null = null;
-  private terminated = false;
+  private connectAbort: AbortController | null = null;
 
   constructor(options: TransportClientOptions) {
     this.limits = normalizeDecodeLimits(options.limits);
-    this.transport = resolveTransport(options);
+    this.connector = resolveConnector(options);
     this.defaultTimeoutMs =
       options.defaultTimeoutMs === undefined
         ? undefined
@@ -238,120 +229,192 @@ export class TransportClient {
         1,
       ),
     };
-    this.session = this.newSession();
+  }
 
-    this.transport.onMessage((p) => this.handleIncoming(p));
-    this.transport.onMessageEnqueued((info) =>
-      this.dispatchMessageEnqueued(info),
+  /** Public lifecycle state: Idle / Connecting / Open / Closing / Stopped. */
+  get state(): TransportState {
+    return this._state;
+  }
+
+  /** Un-narrowed read for post-await checks (TS narrows `this._state`
+   *  across awaits and mistakes the comparison for dead code). */
+  private stateNow(): TransportState {
+    return this._state;
+  }
+
+  isConnected(): boolean {
+    return (
+      this._state === TransportState.Open &&
+      this.session !== null &&
+      this.session.link.isOpen()
     );
-    this.transport.onClose((ev) => this.dispatchClose(ev));
-    this.transport.onError((e) => this.dispatchError(e));
   }
 
   /**
-   * Open the transport with optional retry-on-failure.
-   *
-   * Idempotent on a live connection, single-flight under concurrency: any
-   * number of overlapping `connect()` calls share ONE attempt and observe
-   * its outcome, and exactly one new session is installed per real
-   * (re)connection.
+   * Open a connection. Single-flight (concurrent calls share one attempt),
+   * idempotent while Open, refused after `shutdown()`, and CANCELLABLE:
+   * `disconnect()`/`shutdown()` abort an in-flight dial, and a dial that
+   * "wins" after cancellation is closed instead of installed.
    */
   connect(): Promise<void> {
-    if (this.terminated) {
+    if (this._state === TransportState.Stopped) {
       return Promise.reject(new TransportError('client is shut down'));
     }
-    if (this.transport.isConnected() && !this.session.closed) {
-      return Promise.resolve();
-    }
+    if (this.isConnected()) return Promise.resolve();
     if (this.connectFlight) return this.connectFlight;
-    const flight = this.doConnect().finally(() => {
-      if (this.connectFlight === flight) this.connectFlight = null;
+    const abort = new AbortController();
+    this.connectAbort = abort;
+    const flight = this.doConnect(abort).finally(() => {
+      if (this.connectFlight === flight) {
+        this.connectFlight = null;
+        this.connectAbort = null;
+      }
     });
     this.connectFlight = flight;
     return flight;
   }
 
-  private async doConnect(): Promise<void> {
+  private async doConnect(abort: AbortController): Promise<void> {
+    this._state = TransportState.Connecting;
     const total = this.retryOpts.maxRetries + 1;
     let lastError: unknown = new TransportError('connect failed');
     for (let attempt = 0; attempt < total; attempt++) {
       if (attempt > 0) {
-        try {
-          await this.transport.close();
-        } catch {
-          // Ignore — the next connect attempt will surface any real problem.
-        }
         const delay = Math.min(
           this.retryOpts.maxDelayMs,
           this.retryOpts.initialDelayMs *
             Math.pow(this.retryOpts.multiplier, attempt - 1),
         );
         await sleep(delay);
-        if (this.terminated) throw new TransportError('client is shut down');
+      }
+      if (abort.signal.aborted) {
+        if (this._state === TransportState.Connecting) {
+          this._state = TransportState.Idle;
+        }
+        throw new TransportError('connect aborted');
       }
       try {
-        await this.transport.connect();
-        // Exactly one session per real connection, installed by the single
-        // flight. The OLD session is closed first, which voids all of its
-        // still-running async work — no event from any adapter required.
-        this.retireSession(new TransportError('connection superseded'));
-        this.session = this.newSession();
+        const link = await this.connector.connect({ signal: abort.signal });
+        // THE LIFECYCLE GATE: a dial that resolves after disconnect()/
+        // shutdown() aborted it must not install anything — close the
+        // connection it won and report cancellation.
+        if (abort.signal.aborted || this.stateNow() === TransportState.Stopped) {
+          await link.close({ reason: 'connect aborted' });
+          throw new TransportError('connect aborted');
+        }
+        this.installSession(link);
+        this._state = TransportState.Open;
         return;
       } catch (e) {
+        if (abort.signal.aborted || this.stateNow() === TransportState.Stopped) {
+          if (this._state === TransportState.Connecting) {
+            this._state = TransportState.Idle;
+          }
+          throw e instanceof Error ? e : new TransportError(String(e));
+        }
         lastError = e;
       }
+    }
+    if (this._state === TransportState.Connecting) {
+      this._state = TransportState.Idle;
     }
     throw lastError;
   }
 
+  private installSession(link: TransportSession): void {
+    this.retireSession(new TransportError('connection superseded'));
+    const session = new ClientSession(
+      link,
+      this.defaultTimeoutMs,
+      this.codecs,
+      this.limits,
+      this.inboundCaps,
+      (info) => {
+        if (session === this.session) {
+          this.dispatchMessageEnqueued(info);
+          this.dispatchActivity();
+        }
+      },
+    );
+    // The observer is bound to THIS session: an old link's late events act
+    // on the old (retired) session and stop there — by construction, not by
+    // a generation check someone has to remember.
+    session.unsubscribe = link.subscribe({
+      onMessage: (packet) => this.handleInbound(session, packet),
+      onClose: (ev) => this.handleLinkClose(session, ev),
+      onError: (e) => {
+        if (session === this.session && !session.closed) this.dispatchError(e);
+      },
+    });
+    this.session = session;
+  }
+
   /**
-   * End the current connection. Reconnecting afterwards is allowed —
-   * this is the "hang up" verb, not the "destroy the client" one.
+   * End the current connection (and cancel a connect in flight). The client
+   * returns to Idle; reconnecting is allowed.
    */
   async disconnect(): Promise<void> {
-    // Retire FIRST: even an adapter that never fires a close event cannot
-    // leave the old session's async work alive.
-    this.retireSession(new TransportError('disconnected'));
-    await this.transport.close();
+    this.connectAbort?.abort();
+    if (this.connectFlight) {
+      await this.connectFlight.catch(() => {});
+    }
+    const session = this.session;
+    if (session) {
+      this._state = TransportState.Closing;
+      // Retire first: even a link whose close() never reports cannot leave
+      // the session's async work alive.
+      this.retireSession(new TransportError('disconnected'));
+      await session.link.close({ reason: 'disconnected' });
+      if (this.stateNow() !== TransportState.Stopped) {
+        this._state = TransportState.Idle;
+      }
+      // The close EVENT fires for every session end, intentional included —
+      // consumers (reconnect state machines, UI) key their lifecycle on it
+      // and distinguish wanted from unwanted closes with their own flag.
+      // Retiring unsubscribed the link observer, so this is the one
+      // deterministic notification.
+      this.emitClose({ reason: 'disconnected', intentional: true });
+      return;
+    }
+    if (this._state !== TransportState.Stopped) {
+      this._state = TransportState.Idle;
+    }
   }
 
-  /**
-   * Terminal shutdown: disconnects and refuses every future `connect()`.
-   * Use `disconnect()` for a connection you intend to re-establish.
-   */
+  /** Terminal shutdown: disconnects and refuses every future `connect()`. */
   async shutdown(): Promise<void> {
-    this.terminated = true;
-    await this.disconnect();
-  }
-
-  isConnected(): boolean {
-    return this.transport.isConnected();
+    this._state = TransportState.Stopped;
+    this.connectAbort?.abort();
+    if (this.connectFlight) {
+      await this.connectFlight.catch(() => {});
+    }
+    const session = this.session;
+    if (session) {
+      this.retireSession(new TransportError('shut down'));
+      await session.link.close({ reason: 'shut down' });
+      this.emitClose({ reason: 'shut down', intentional: true });
+    }
+    this._state = TransportState.Stopped;
   }
 
   /**
-   * One-way send. Resolves when the packet was ACCEPTED by the socket's
-   * outbound buffer (enqueue-confirmed — a browser WebSocket offers no
-   * write confirmation, and this API does not pretend otherwise).
-   *
-   * SESSION-BOUND: the send belongs to the connection that was current when
-   * it was CALLED. If the connection turns over while (async) compression
-   * runs, the send is refused — completing it would silently replay a
-   * request the application never chose to retry.
+   * One-way send, enqueue-confirmed, SESSION-BOUND: the send belongs to the
+   * connection that was current when it was CALLED, and its enqueue lands on
+   * that session's link (which rejects once closed) — an async compression
+   * cannot carry it across a reconnect.
    */
   send(payload: Uint8Array, options: SendOptions = {}): Promise<void> {
     const session = this.session;
+    if (!session || session.closed) {
+      return Promise.reject(new TransportError('not connected'));
+    }
     if (this.canBypassChain(session, options)) {
       return session.manager.send(
-        this.buildPlain(PacketType.OneWay, payload, options),
+        buildPlain(PacketType.OneWay, payload, options),
       );
     }
     return this.scheduleOutbound(session, payload.length, async () => {
-      const packet = await this.buildOutbound(
-        PacketType.OneWay,
-        payload,
-        options,
-      );
-      this.requireCurrent(session);
+      const packet = await this.buildOutbound(session, PacketType.OneWay, payload, options);
       await session.manager.send(packet);
     });
   }
@@ -364,8 +427,11 @@ export class TransportClient {
       requireNonNegativeFinite('timeoutMs', options.timeoutMs);
     }
     const session = this.session;
+    if (!session || session.closed) {
+      throw new TransportError('not connected');
+    }
     if (this.canBypassChain(session, options)) {
-      const packet = this.buildPlain(PacketType.Request, payload, options);
+      const packet = buildPlain(PacketType.Request, payload, options);
       const response = await session.manager.request(packet, {
         timeoutMs: options.timeoutMs,
       });
@@ -376,11 +442,11 @@ export class TransportClient {
       payload.length,
       async () => {
         const packet = await this.buildOutbound(
+          session,
           PacketType.Request,
           payload,
           options,
         );
-        this.requireCurrent(session);
         return {
           response: session.manager.request(packet, {
             timeoutMs: options.timeoutMs,
@@ -411,10 +477,9 @@ export class TransportClient {
       return () => removeFrom(this.messageListeners, fn);
     }
     if (event === 'request') {
-      // ONE consumer: a request carries a single response obligation, and
-      // fanning it out to several handlers splits that responsibility —
-      // whoever answers second discovers it at runtime. Rust 2.0's single
-      // SessionHandler is the same rule.
+      // ONE consumer: a request carries a single response obligation.
+      // Liveness monitoring must NOT occupy this slot — use
+      // `observeActivity()` for that.
       if (this.requestListener) {
         throw new TransportError(
           'a request consumer is already registered; requests have exactly one',
@@ -441,57 +506,70 @@ export class TransportClient {
     return () => removeFrom(this.errorListeners, fn);
   }
 
-  // ----- session plumbing -----
-
-  private newSession(): Session {
-    return new Session(
-      this.transport,
-      this.defaultTimeoutMs,
-      this.codecs,
-      this.limits,
-      this.inboundCaps,
-    );
+  /**
+   * Liveness tap: fires on any traffic in either direction (inbound message,
+   * request, consumed response; outbound enqueue). Multi-subscriber, so a
+   * heartbeat can track activity without occupying the single request
+   * consumer slot.
+   */
+  observeActivity(cb: () => void): () => void {
+    this.activityListeners.push(cb);
+    return () => removeFrom(this.activityListeners, cb);
   }
+
+  // ----- session plumbing -----
 
   private retireSession(reason: TransportError): void {
     const old = this.session;
-    if (old.closed) return;
-    old.closed = true;
-    old.manager.reset(reason);
+    if (!old) return;
+    this.session = null;
+    old.retire(reason);
   }
 
-  private requireCurrent(session: Session): void {
-    if (session !== this.session || session.closed) {
-      throw new TransportError('connection changed; not sent');
-    }
-  }
-
-  private handleIncoming(packet: Packet): void {
-    // ALL inbound traffic passes through the SESSION's normalizer:
-    // compressed bodies are decompressed exactly once, delivery order is
-    // arrival order, and everything is bound to the session the packet
-    // arrived on — a reconnect installs a fresh session, so old in-flight
-    // work has nowhere to deliver, with or without an adapter close event.
-    const session = this.session;
+  private handleInbound(session: ClientSession, packet: Packet): void {
     if (session.closed) return;
     session.normalizer.push(
       packet,
       (p) => {
-        if (session !== this.session || session.closed) return;
+        if (session.closed) return;
         this.route(session, p);
       },
       (e) => {
-        if (session !== this.session || session.closed) return;
+        if (session.closed) return;
         this.dispatchError(e);
-        void this.transport.close();
+        void session.link.close({ reason: 'protocol violation' });
       },
     );
   }
 
-  private route(session: Session, packet: Packet): void {
+  private handleLinkClose(session: ClientSession, ev: unknown): void {
+    const wasCurrent = session === this.session;
+    session.retire(new TransportError('transport closed'));
+    if (!wasCurrent) return; // an old link's close is its own business
+    this.session = null;
+    if (
+      this._state !== TransportState.Stopped &&
+      this._state !== TransportState.Connecting
+    ) {
+      this._state = TransportState.Idle;
+    }
+    this.emitClose(ev);
+  }
+
+  private emitClose(ev: unknown): void {
+    for (const cb of [...this.closeListeners]) {
+      try {
+        cb(ev);
+      } catch {
+        /* swallow */
+      }
+    }
+  }
+
+  private route(session: ClientSession, packet: Packet): void {
+    this.dispatchActivity();
     if (session.manager.handleIncoming(packet)) return;
     if (packet.packetType === PacketType.Response) {
-      // Orphan Response: dropped + reported, never surfaced as data.
       this.dispatchError(
         new TransportError(
           `dropped orphan Response (messageId=${packet.messageId}, ` +
@@ -514,7 +592,7 @@ export class TransportClient {
       return;
     }
     const msg = new ClientMessageImpl(packet);
-    for (const cb of this.messageListeners) {
+    for (const cb of [...this.messageListeners]) {
       try {
         cb(msg);
       } catch (e) {
@@ -524,38 +602,31 @@ export class TransportClient {
   }
 
   private respondTo(
-    session: Session,
+    session: ClientSession,
     request: ClientRequestImpl,
     payload: Uint8Array,
     options: SendOptions,
   ): Promise<void> {
     const merged = { ...options, bizType: options.bizType ?? request.bizType };
     if (this.canBypassChain(session, merged)) {
-      try {
-        this.requireCurrent(session);
-      } catch (e) {
-        return Promise.reject(e);
-      }
       return session.manager.sendResponse(
-        this.buildPlain(PacketType.Response, payload, merged, request.messageId),
+        buildPlain(PacketType.Response, payload, merged, request.messageId),
       );
     }
     return this.scheduleOutbound(session, payload.length, async () => {
       const packet = await this.buildOutbound(
+        session,
         PacketType.Response,
         payload,
         merged,
         request.messageId,
       );
-      // Session re-check AFTER the (async) compression: a response built
-      // for one connection must never be written onto its replacement — on
-      // the server it could complete a DIFFERENT request with the same id.
-      this.requireCurrent(session);
       await session.manager.sendResponse(packet);
     });
   }
 
   private async buildOutbound(
+    session: ClientSession,
     packetType: PacketType,
     payload: Uint8Array,
     options: SendOptions,
@@ -566,7 +637,13 @@ export class TransportClient {
     let compression: CompressionType = CompressionType.None;
     if (requested !== CompressionType.None) {
       const codec = this.codecs.require(requested);
-      body = await codec.compress(payload, this.limits.maxPayloadLen);
+      // The session's abort signal: retiring the session cancels this
+      // compression instead of letting it hang onto its buffers forever.
+      body = await codec.compress(
+        payload,
+        this.limits.maxPayloadLen,
+        session.abort.signal,
+      );
       compression = requested;
     }
     return new Packet({
@@ -579,38 +656,17 @@ export class TransportClient {
     });
   }
 
-  /** Sync bypass is safe only when there is no codec work AND nothing is
-   *  queued on the session's chain (otherwise this packet would overtake
-   *  it) AND the session is still current. */
-  private canBypassChain(session: Session, options: SendOptions): boolean {
+  private canBypassChain(session: ClientSession, options: SendOptions): boolean {
     const requested = options.compression ?? CompressionType.None;
     return (
       requested === CompressionType.None &&
       session.outboundFrames === 0 &&
-      session === this.session &&
       !session.closed
     );
   }
 
-  /** Synchronous packet construction for the no-compression path. */
-  private buildPlain(
-    packetType: PacketType,
-    payload: Uint8Array,
-    options: SendOptions,
-    messageId = 0,
-  ): Packet {
-    return new Packet({
-      packetType,
-      messageId,
-      bizType: options.bizType ?? 0,
-      extHeader: options.extHeader,
-      compression: CompressionType.None,
-      payload,
-    });
-  }
-
   private scheduleOutbound<T>(
-    session: Session,
+    session: ClientSession,
     payloadBytes: number,
     op: () => Promise<T>,
   ): Promise<T> {
@@ -618,9 +674,6 @@ export class TransportClient {
       session.outboundFrames >= this.maxOutboundQueue ||
       session.outboundBytes + payloadBytes > this.maxOutboundQueueBytes
     ) {
-      // BOUNDED in ops AND bytes: a stalled compression cannot let sends —
-      // or their captured payloads — pile up without limit. The connection
-      // stays healthy; the caller backs off.
       return Promise.reject(
         new QueueOverflowError(
           'outbound',
@@ -647,7 +700,7 @@ export class TransportClient {
   }
 
   private dispatchMessageEnqueued(info: EnqueuedInfo): void {
-    for (const cb of this.messageEnqueuedListeners) {
+    for (const cb of [...this.messageEnqueuedListeners]) {
       try {
         cb(info);
       } catch (e) {
@@ -656,11 +709,10 @@ export class TransportClient {
     }
   }
 
-  private dispatchClose(ev?: unknown): void {
-    this.retireSession(new TransportError('transport closed'));
-    for (const cb of this.closeListeners) {
+  private dispatchActivity(): void {
+    for (const cb of [...this.activityListeners]) {
       try {
-        cb(ev);
+        cb();
       } catch {
         /* swallow */
       }
@@ -668,7 +720,7 @@ export class TransportClient {
   }
 
   private dispatchError(e: unknown): void {
-    for (const cb of this.errorListeners) {
+    for (const cb of [...this.errorListeners]) {
       try {
         cb(e);
       } catch {
@@ -745,16 +797,32 @@ class ClientRequestImpl implements ClientRequest {
   }
 }
 
-function resolveTransport(options: TransportClientOptions): Transport {
+function buildPlain(
+  packetType: PacketType,
+  payload: Uint8Array,
+  options: SendOptions,
+  messageId = 0,
+): Packet {
+  return new Packet({
+    packetType,
+    messageId,
+    bizType: options.bizType ?? 0,
+    extHeader: options.extHeader,
+    compression: CompressionType.None,
+    payload,
+  });
+}
+
+function resolveConnector(options: TransportClientOptions): TransportConnector {
   if (options.transport && typeof options.transport === 'object') {
     return options.transport;
   }
   if (!options.url) {
     throw new TransportError(
-      'TransportClient requires either `url` (for the default WebSocket transport) or a `transport` instance',
+      'TransportClient requires either `url` (for the default WebSocket connector) or a `transport` connector',
     );
   }
-  return new WebSocketTransport({
+  return new WebSocketConnector({
     url: options.url,
     protocols: options.protocols,
     webSocketFactory: options.webSocketFactory,

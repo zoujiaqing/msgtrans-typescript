@@ -12,8 +12,18 @@ import { DecodeLimitError, UnsupportedCompressionError } from './errors.js';
  */
 export interface CompressionCodec {
   readonly type: CompressionType;
-  compress(input: Uint8Array, limit: number): Promise<Uint8Array>;
-  decompress(input: Uint8Array, limit: number): Promise<Uint8Array>;
+  /** `signal` (when provided) aborts the operation: a retired session's
+   *  hung compression must release its memory, not linger forever. */
+  compress(
+    input: Uint8Array,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array>;
+  decompress(
+    input: Uint8Array,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array>;
 }
 
 export class CodecRegistry {
@@ -66,14 +76,28 @@ function requireStream(name: 'CompressionStream' | 'DecompressionStream'): Strea
 export class ZlibCodec implements CompressionCodec {
   readonly type = CompressionType.Zlib;
 
-  async compress(input: Uint8Array, limit: number): Promise<Uint8Array> {
+  async compress(
+    input: Uint8Array,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
     const Ctor = requireStream('CompressionStream');
-    return pumpThrough(new Ctor('deflate'), input, limit, 'compressed');
+    return pumpThrough(new Ctor('deflate'), input, limit, 'compressed', signal);
   }
 
-  async decompress(input: Uint8Array, limit: number): Promise<Uint8Array> {
+  async decompress(
+    input: Uint8Array,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
     const Ctor = requireStream('DecompressionStream');
-    return pumpThrough(new Ctor('deflate'), input, limit, 'decompressed');
+    return pumpThrough(
+      new Ctor('deflate'),
+      input,
+      limit,
+      'decompressed',
+      signal,
+    );
   }
 }
 
@@ -90,7 +114,11 @@ async function pumpThrough(
   input: Uint8Array,
   limit: number,
   direction: string,
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
+  if (signal?.aborted) {
+    throw new DecodeLimitError(`${direction}: aborted`);
+  }
   const writer = stream.writable.getWriter();
   const writing = (async () => {
     await writer.write(input);
@@ -106,6 +134,10 @@ async function pumpThrough(
   let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
+    if (signal?.aborted) {
+      await reader.cancel();
+      throw new DecodeLimitError(`${direction}: aborted`);
+    }
     if (done) break;
     total += value.byteLength;
     if (total > limit) {

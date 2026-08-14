@@ -7,11 +7,10 @@ import {
   Packet,
   PacketType,
   TransportClient,
-  WebSocketTransport,
+  WebSocketConnector,
   ZlibCodec,
   type WebSocketLike,
 } from '../src/index.js';
-import { WebTransportTransport, type WebTransportLike } from '../src/experimental.js';
 import { FakeTransport, flush, until } from './fake-transport.js';
 
 const text = (s: string) => new TextEncoder().encode(s);
@@ -113,7 +112,7 @@ describe('P0-2: inbound normalization is generation-bound and poisonable', () =>
   });
 });
 
-describe('P0-3: connect/close lifecycle is cancel-safe', () => {
+describe('P0-3: connect/close lifecycle is cancel-safe (client gate)', () => {
   class HangingWS implements WebSocketLike {
     binaryType = 'blob';
     readyState = 0;
@@ -128,72 +127,80 @@ describe('P0-3: connect/close lifecycle is cancel-safe', () => {
     }
   }
 
-  it('WS: close() during Connecting rejects the pending connect()', async () => {
-    const transport = new WebSocketTransport({
+  it('disconnect() during connect() rejects the pending connect (hung handshake included)', async () => {
+    const c = new TransportClient({
       url: 'ws://test.invalid',
       webSocketFactory: () => new HangingWS(),
     });
-    const connecting = transport.connect();
+    const connecting = c.connect();
     const observed = connecting.then(
       () => 'resolved',
       () => 'rejected',
     );
-    await transport.close();
-    // Pre-fix: state went Closing before onclose, wasConnecting was false,
-    // and the connect() promise stayed pending FOREVER.
-    const outcome = await Promise.race([observed, sleep(200).then(() => 'pending')]);
+    await c.disconnect();
+    const outcome = await Promise.race([
+      observed,
+      sleep(200).then(() => 'pending'),
+    ]);
     expect(outcome).toBe('rejected');
+    expect(c.isConnected()).toBe(false);
   });
 
-  it('WT: a factory that throws synchronously does not wedge the state machine', async () => {
+  it('a dial that wins AFTER disconnect() is closed, not installed', async () => {
+    // The eighth review's exact counterexample: the in-flight
+    // transport.connect used to complete after disconnect() and still
+    // install a session — isConnected() came back true.
+    const sockets: HangingWS[] = [];
+    const c = new TransportClient({
+      url: 'ws://test.invalid',
+      webSocketFactory: () => {
+        const ws = new HangingWS();
+        sockets.push(ws);
+        return ws;
+      },
+    });
+    const connecting = c.connect().catch(() => {});
+    const disconnecting = c.disconnect();
+    // The platform completes the handshake AFTER the abort.
+    sockets[0]!.readyState = 1;
+    sockets[0]!.onopen?.({});
+    await connecting;
+    await disconnecting;
+    expect(c.isConnected()).toBe(false);
+  });
+
+  it('shutdown() during connect() leaves the client Stopped and connect() refused forever', async () => {
+    const c = new TransportClient({
+      url: 'ws://test.invalid',
+      webSocketFactory: () => new HangingWS(),
+    });
+    const connecting = c.connect().catch(() => {});
+    await c.shutdown();
+    await connecting;
+    expect(c.isConnected()).toBe(false);
+    await expect(c.connect()).rejects.toThrow(/shut down/);
+  });
+
+  it('a connector factory that throws synchronously does not wedge later connects', async () => {
     let attempts = 0;
-    const good = new FakeWTSession();
-    const transport = new WebTransportTransport({
-      url: 'https://test.invalid/wt',
-      webTransportFactory: () => {
+    const good = new HangingWS();
+    const c = new TransportClient({
+      url: 'ws://test.invalid',
+      webSocketFactory: () => {
         attempts += 1;
-        if (attempts === 1) throw new Error('no WebTransport here');
+        if (attempts === 1) throw new Error('no socket here');
         return good;
       },
     });
-    await expect(transport.connect()).rejects.toThrow('no WebTransport here');
-    // Pre-fix: state stayed Connecting forever and every retry was refused.
-    await transport.connect();
-    expect(transport.isConnected()).toBe(true);
-  });
-
-  it('WT: close() during connect() makes that connect() fail, not report success', async () => {
-    let releaseReady!: () => void;
-    const gate = new Promise<void>((r) => {
-      releaseReady = r;
-    });
-    const session = new FakeWTSession(gate);
-    const transport = new WebTransportTransport({
-      url: 'https://test.invalid/wt',
-      webTransportFactory: () => session,
-    });
-    const connecting = transport.connect();
-    await transport.close();
-    releaseReady();
-    await expect(connecting).rejects.toThrow();
-    expect(transport.isConnected()).toBe(false);
+    await expect(c.connect()).rejects.toThrow('no socket here');
+    const second = c.connect();
+    good.readyState = 1;
+    good.onopen?.({});
+    await second;
+    expect(c.isConnected()).toBe(true);
   });
 });
 
-/** Minimal in-memory WT session for the lifecycle tests. */
-class FakeWTSession implements WebTransportLike {
-  readonly ready: Promise<void>;
-  readonly closed: Promise<unknown> = new Promise(() => {});
-  constructor(ready: Promise<void> = Promise.resolve()) {
-    this.ready = ready;
-  }
-  close(): void {}
-  async createBidirectionalStream() {
-    const s = new TransformStream<Uint8Array, Uint8Array>();
-    const c = new TransformStream<Uint8Array, Uint8Array>();
-    return { readable: s.readable, writable: c.writable };
-  }
-}
 
 describe('P1: stale async results cannot fire', () => {
   it('a probe still in flight when HeartbeatMonitor.stop() runs cannot declare death', async () => {

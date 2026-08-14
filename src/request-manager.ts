@@ -4,7 +4,7 @@ import {
   RequestTimeoutError,
   TransportError,
 } from './errors.js';
-import type { Transport } from './transport.js';
+import type { TransportSession } from './transport.js';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const U32_MAX = 0xffffffff;
@@ -12,6 +12,8 @@ const U32_MAX = 0xffffffff;
 export interface RequestManagerOptions {
   /** Default request timeout in milliseconds. Default: 10_000. */
   defaultTimeoutMs?: number;
+  /** Fired after every successful enqueue (send / request / response). */
+  onEnqueued?: (info: { messageId: number }) => void;
   /**
    * Starting value of the messageId counter (1..0xffffffff, 0 is reserved).
    * INTERNAL — exists so tests can reach the exhaustion boundary without
@@ -39,19 +41,21 @@ interface PendingEntry {
  * different waiter that happened to draw the same id.
  */
 export class RequestManager {
-  private readonly transport: Transport;
+  private readonly link: TransportSession;
+  private readonly onEnqueued: (info: { messageId: number }) => void;
   private readonly defaultTimeoutMs: number;
   private readonly initialMessageId: number;
   private readonly pending = new Map<number, PendingEntry>();
   private counter: number;
 
-  constructor(transport: Transport, options: RequestManagerOptions = {}) {
-    this.transport = transport;
+  constructor(link: TransportSession, options: RequestManagerOptions = {}) {
+    this.link = link;
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.initialMessageId = normalizeCounterStart(
       options.initialMessageId ?? 1,
     );
     this.counter = this.initialMessageId;
+    this.onEnqueued = options.onEnqueued ?? (() => {});
     // NO transport subscriptions: a manager belongs to ONE session and the
     // session's owner resets it. Subscribing here would leak one listener
     // per reconnect (the Transport SPI has no unsubscribe) and re-create the
@@ -68,7 +72,8 @@ export class RequestManager {
    */
   async send(packet: Packet): Promise<void> {
     packet.messageId = this.nextMessageId();
-    await this.transport.send(packet);
+    await this.link.enqueue(packet);
+    this.onEnqueued({ messageId: packet.messageId });
   }
 
   /**
@@ -82,7 +87,8 @@ export class RequestManager {
         'sendResponse only accepts Response packets',
       );
     }
-    await this.transport.send(packet);
+    await this.link.enqueue(packet);
+    this.onEnqueued({ messageId: packet.messageId });
   }
 
   /**
@@ -115,8 +121,9 @@ export class RequestManager {
       const entry: PendingEntry = { resolve, reject, timer: null };
       this.pending.set(messageId, entry);
 
-      this.transport.send(packet).then(
+      this.link.enqueue(packet).then(
         () => {
+          this.onEnqueued({ messageId });
           if (this.pending.get(messageId) !== entry) return; // already resolved
           if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
             entry.timer = setTimeout(() => {
@@ -163,16 +170,6 @@ export class RequestManager {
       if (entry.timer) clearTimeout(entry.timer);
       entry.reject(reason);
     }
-  }
-
-  /**
-   * Start a fresh connection generation: the id counter restarts. Mirrors
-   * Rust 2.0, where a reconnect gets a fresh session with a fresh counter —
-   * safe because the close that preceded it rejected every pending entry,
-   * and stale responders are refused by the client's generation guard.
-   */
-  startGeneration(): void {
-    this.counter = this.initialMessageId;
   }
 
   private nextMessageId(): number {

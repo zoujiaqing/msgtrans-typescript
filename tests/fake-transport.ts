@@ -1,84 +1,131 @@
 import {
   Packet,
+  TransportError,
+  type ConnectOptions,
   type EnqueuedInfo,
-  type Transport,
+  type TransportConnector,
+  type TransportObserver,
+  type TransportSession,
 } from '../src/index.js';
 
-export class FakeTransport implements Transport {
+/** One scripted in-memory connection. */
+export class FakeSession implements TransportSession {
   readonly sent: Packet[] = [];
-  readonly connectCalls: number[] = [];
-  readonly closeCalls: number[] = [];
-
+  private readonly observers: TransportObserver[] = [];
+  private open = true;
   sendShouldFail: Error | null = null;
-  connectShouldFail: Error | null = null;
-  /** When set, send() resolves only after this many ms (async enqueue). */
   sendDelayMs = 0;
+  closeCalls = 0;
 
-  private _isConnected = false;
-  private readonly messageHandlers: Array<(p: Packet) => void> = [];
-  private readonly messageEnqueuedHandlers: Array<(info: EnqueuedInfo) => void> =
-    [];
-  private readonly closeHandlers: Array<(ev?: unknown) => void> = [];
-  private readonly errorHandlers: Array<(e: unknown) => void> = [];
-
-  async connect(): Promise<void> {
-    this.connectCalls.push(Date.now());
-    if (this.connectShouldFail) throw this.connectShouldFail;
-    this._isConnected = true;
+  isOpen(): boolean {
+    return this.open;
   }
 
-  async send(packet: Packet): Promise<void> {
+  async enqueue(packet: Packet): Promise<EnqueuedInfo> {
     if (this.sendDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.sendDelayMs));
     }
+    if (!this.open) throw new TransportError('session is closed');
     if (this.sendShouldFail) throw this.sendShouldFail;
     this.sent.push(packet);
-    const info: EnqueuedInfo = { messageId: packet.messageId };
-    for (const cb of this.messageEnqueuedHandlers) cb(info);
+    return { messageId: packet.messageId };
   }
 
-  async close(): Promise<void> {
-    this.closeCalls.push(Date.now());
-    this._isConnected = false;
+  subscribe(observer: TransportObserver): () => void {
+    this.observers.push(observer);
+    return () => {
+      const i = this.observers.indexOf(observer);
+      if (i >= 0) this.observers.splice(i, 1);
+    };
   }
 
-  isConnected(): boolean {
-    return this._isConnected;
-  }
-
-  onMessage(cb: (packet: Packet) => void): void {
-    this.messageHandlers.push(cb);
-  }
-  onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void {
-    this.messageEnqueuedHandlers.push(cb);
-  }
-  onClose(cb: (event?: unknown) => void): void {
-    this.closeHandlers.push(cb);
-  }
-  onError(cb: (error: unknown) => void): void {
-    this.errorHandlers.push(cb);
+  close(reason?: unknown): Promise<void> {
+    this.closeCalls += 1;
+    if (this.open) {
+      this.open = false;
+      for (const o of [...this.observers])
+        o.onClose?.(reason ?? { reason: 'closed' });
+    }
+    return Promise.resolve();
   }
 
   fireMessage(packet: Packet): void {
-    for (const cb of this.messageHandlers) cb(packet);
+    for (const o of [...this.observers]) o.onMessage?.(packet);
   }
   fireClose(ev?: unknown): void {
-    this._isConnected = false;
-    for (const cb of this.closeHandlers) cb(ev);
+    if (!this.open) return;
+    this.open = false;
+    for (const o of [...this.observers]) o.onClose?.(ev);
   }
   fireError(e: unknown): void {
-    for (const cb of this.errorHandlers) cb(e);
+    for (const o of [...this.observers]) o.onError?.(e);
   }
 }
 
-/** Drain the microtask + macrotask queue once: inbound normalization and the
- *  outbound chain are async, so delivery is never synchronous any more. */
+/**
+ * Scripted connector with the OLD FakeTransport's helper surface so the
+ * existing tests keep their shape: `sent` aggregates across sessions,
+ * `fireMessage`/`fireClose`/`fireError` act on the CURRENT session,
+ * `connectCalls`/`closeCalls` count across the whole run.
+ */
+export class FakeTransport implements TransportConnector {
+  readonly sessions: FakeSession[] = [];
+  readonly connectCalls: number[] = [];
+  connectShouldFail: Error | null = null;
+  /** Applied to each NEW session as it is created. */
+  sendDelayMs = 0;
+  private _sendShouldFail: Error | null = null;
+
+  get sendShouldFail(): Error | null {
+    return this._sendShouldFail;
+  }
+  set sendShouldFail(e: Error | null) {
+    this._sendShouldFail = e;
+    for (const s of this.sessions) s.sendShouldFail = e;
+  }
+
+  get current(): FakeSession | null {
+    const last = this.sessions[this.sessions.length - 1];
+    return last && last.isOpen() ? last : null;
+  }
+
+  /** All packets enqueued on any session, in order. */
+  get sent(): Packet[] {
+    return this.sessions.flatMap((s) => s.sent);
+  }
+
+  get closeCalls(): number[] {
+    // Shape-compat with the old helper (an array whose length counts closes).
+    return this.sessions.flatMap((s) => Array(s.closeCalls).fill(0));
+  }
+
+  async connect(_options: ConnectOptions): Promise<TransportSession> {
+    this.connectCalls.push(Date.now());
+    if (this.connectShouldFail) throw this.connectShouldFail;
+    const session = new FakeSession();
+    session.sendDelayMs = this.sendDelayMs;
+    session.sendShouldFail = this._sendShouldFail;
+    this.sessions.push(session);
+    return session;
+  }
+
+  fireMessage(packet: Packet): void {
+    this.sessions[this.sessions.length - 1]?.fireMessage(packet);
+  }
+  fireClose(ev?: unknown): void {
+    this.sessions[this.sessions.length - 1]?.fireClose(ev);
+  }
+  fireError(e: unknown): void {
+    this.sessions[this.sessions.length - 1]?.fireError(e);
+  }
+}
+
+/** Drain the microtask + macrotask queue once. */
 export function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** Poll until `cond` holds (native decompression takes several async hops,
- *  so a single flush is not deterministic). Throws after `timeoutMs`. */
+/** Poll until `cond` holds. Throws after `timeoutMs`. */
 export async function until(
   cond: () => boolean,
   timeoutMs = 2000,

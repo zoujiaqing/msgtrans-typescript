@@ -16,8 +16,10 @@ import { CompressionType } from './packet.js';
  */
 export interface CompressionCodec {
     readonly type: CompressionType;
-    compress(input: Uint8Array, limit: number): Promise<Uint8Array>;
-    decompress(input: Uint8Array, limit: number): Promise<Uint8Array>;
+    /** `signal` (when provided) aborts the operation: a retired session's
+     *  hung compression must release its memory, not linger forever. */
+    compress(input: Uint8Array, limit: number, signal?: AbortSignal): Promise<Uint8Array>;
+    decompress(input: Uint8Array, limit: number, signal?: AbortSignal): Promise<Uint8Array>;
 }
 export declare class CodecRegistry {
     private readonly codecs;
@@ -35,8 +37,8 @@ export declare class CodecRegistry {
  */
 export declare class ZlibCodec implements CompressionCodec {
     readonly type: 2;
-    compress(input: Uint8Array, limit: number): Promise<Uint8Array>;
-    decompress(input: Uint8Array, limit: number): Promise<Uint8Array>;
+    compress(input: Uint8Array, limit: number, signal?: AbortSignal): Promise<Uint8Array>;
+    decompress(input: Uint8Array, limit: number, signal?: AbortSignal): Promise<Uint8Array>;
 }
 //# sourceMappingURL=codec.d.ts.map
 // ===== constants.d.ts =====
@@ -148,8 +150,8 @@ export declare class RequestTimeoutError extends Error {
 }
 //# sourceMappingURL=errors.d.ts.map
 // ===== experimental.d.ts =====
-export { WebTransportTransport } from './webtransport-transport.js';
-export type { WebTransportLike, WebTransportFactory, WebTransportTransportOptions, } from './webtransport-transport.js';
+export { WebTransportConnector } from './webtransport-transport.js';
+export type { WebTransportLike, WebTransportFactory, WebTransportConnectorOptions, } from './webtransport-transport.js';
 //# sourceMappingURL=experimental.d.ts.map
 // ===== heartbeat.d.ts =====
 import type { TransportClient } from './transport-client.js';
@@ -214,9 +216,9 @@ export declare class HeartbeatMonitor {
 export { Packet, PacketType, CompressionType, ReservedFlag, DEFAULT_DECODE_LIMITS, normalizeDecodeLimits, } from './packet.js';
 export type { PacketInit, DecodeLimits } from './packet.js';
 export { TransportState } from './transport.js';
-export type { Transport, EnqueuedInfo } from './transport.js';
-export { WebSocketTransport, DEFAULT_MAX_BUFFERED_BYTES, } from './websocket-transport.js';
-export type { WebSocketLike, WebSocketFactory, WebSocketTransportOptions, TextFramePolicy, } from './websocket-transport.js';
+export type { ConnectOptions, EnqueuedInfo, TransportConnector, TransportObserver, TransportSession, } from './transport.js';
+export { WebSocketConnector, DEFAULT_MAX_BUFFERED_BYTES, } from './websocket-transport.js';
+export type { WebSocketLike, WebSocketFactory, WebSocketConnectorOptions, TextFramePolicy, } from './websocket-transport.js';
 export { HeartbeatMonitor } from './heartbeat.js';
 export type { HeartbeatOptions } from './heartbeat.js';
 export { ReconnectManager } from './reconnect.js';
@@ -392,16 +394,16 @@ export declare class ReconnectManager {
 // ===== transport-client.d.ts =====
 import { CompressionType, type DecodeLimits } from './packet.js';
 import { type CompressionCodec } from './codec.js';
-import type { EnqueuedInfo, Transport } from './transport.js';
+import { type EnqueuedInfo, type TransportConnector, TransportState } from './transport.js';
 import { type TextFramePolicy, type WebSocketFactory } from './websocket-transport.js';
 export interface SendOptions {
     bizType?: number;
     extHeader?: Uint8Array;
     /**
      * Compression algorithm. The registered codec is applied on THIS side
-     * before enqueue; if no codec is registered for the algorithm the send
-     * rejects — a raw payload is never shipped under a compressed header.
-     * `ZlibCodec` is registered by default; Zstd is injectable via
+     * before enqueue; no codec for the algorithm rejects the send — a raw
+     * payload is never shipped under a compressed header. `ZlibCodec` is
+     * registered by default; Zstd is injectable via
      * `TransportClientOptions.codecs`.
      */
     compression?: CompressionType;
@@ -412,68 +414,41 @@ export interface RequestOptions extends SendOptions {
 }
 export interface TransportClientOptions {
     url?: string;
-    transport?: 'websocket' | Transport;
+    /** A custom connection factory; defaults to `WebSocketConnector` built
+     *  from `url` + the WebSocket options below. */
+    transport?: 'websocket' | TransportConnector;
     protocols?: string | string[];
     webSocketFactory?: WebSocketFactory;
     onTextFrame?: TextFramePolicy;
     /** Outbound-buffer high-water mark; see
-     *  `WebSocketTransportOptions.maxBufferedBytes`. */
+     *  `WebSocketConnectorOptions.maxBufferedBytes`. */
     maxBufferedBytes?: number;
     defaultTimeoutMs?: number;
-    /**
-     * Frame caps, enforced in both directions (default: 16 MiB payload /
-     * 65535 ext header — the Rust 2.0 defaults, so both peers agree on what
-     * fits). Also bounds decompressed size.
-     */
+    /** Frame caps, both directions (defaults mirror Rust 2.0). */
     limits?: Partial<DecodeLimits>;
-    /**
-     * Inbound normalization queue caps (packets queued behind an in-flight
-     * decompression; bytes counted as full frame size — header + ext +
-     * payload). Overflow closes the connection: the browser cannot pause the
-     * socket, but it can refuse to buffer without limit.
-     * Defaults: 8192 frames / 64 MiB.
-     */
+    /** Inbound normalization queue caps. Defaults: 8192 frames / 64 MiB. */
     maxInboundQueueFrames?: number;
     maxInboundQueueBytes?: number;
-    /**
-     * Outbound chain caps (sends queued behind an in-flight compression), in
-     * operations AND captured payload bytes. Exceeding either rejects the
-     * send with `QueueOverflowError` — the connection stays healthy.
-     * Defaults: 8192 ops / 64 MiB.
-     */
+    /** Outbound chain caps (ops AND captured payload bytes). Defaults:
+     *  8192 / 64 MiB. Overflow rejects with `QueueOverflowError`. */
     maxOutboundQueue?: number;
     maxOutboundQueueBytes?: number;
-    /**
-     * Additional compression codecs. `ZlibCodec` (native
-     * Compression/DecompressionStream) is always registered; entries here can
-     * add Zstd or override the built-in.
-     */
+    /** Additional compression codecs (Zlib is built in). */
     codecs?: readonly CompressionCodec[];
     /**
      * Connect-time retry policy for a SINGLE `connect()` call. Default: no
-     * retry (one attempt). When running a `ReconnectManager` on top, leave
-     * this at its zero default — stacking both multiplies attempt counts and
-     * wait times; the manager is THE retry policy.
+     * retry. Leave at zero when running a `ReconnectManager` on top — the
+     * manager is THE retry policy.
      */
     connectRetry?: ConnectRetryOptions;
 }
-/**
- * Connect-time retry policy. Mirrors Rust `msgtrans` `RetryConfig`.
- *
- *   - `maxRetries`: number of ADDITIONAL attempts after the first one
- *     fails. Total attempts = `maxRetries + 1`. Default 0 (no retry).
- *   - `initialDelayMs`: delay before the FIRST retry. Default 100.
- *   - `maxDelayMs`: cap applied after exponential growth. Default 10_000.
- *   - `multiplier`: per-attempt backoff multiplier. Default 2.
- */
 export interface ConnectRetryOptions {
     maxRetries?: number;
     initialDelayMs?: number;
     maxDelayMs?: number;
     multiplier?: number;
 }
-/** A one-way message delivered to the application. Always plaintext: the
- *  inbound normalizer has already undone any compression. */
+/** A one-way message delivered to the application. Always plaintext. */
 export interface ClientMessage {
     readonly kind: 'message';
     readonly payload: Uint8Array;
@@ -486,9 +461,8 @@ export interface ClientMessage {
 /**
  * A request delivered to the client that carries the obligation to answer.
  * An INTERFACE by design: the implementation is not exported, so no consumer
- * can construct one and respond with an arbitrary messageId — the forgeable
- * handle Rust 2.0 makes unrepresentable. `respond()` answers at most once,
- * and only onto the connection session it arrived on.
+ * can construct one and respond with an arbitrary messageId. `respond()`
+ * answers at most once, and only onto the session it arrived on.
  */
 export interface ClientRequest {
     readonly kind: 'request';
@@ -502,7 +476,7 @@ export interface ClientRequest {
     respond(payload: Uint8Array, options?: SendOptions): Promise<void>;
 }
 export declare class TransportClient {
-    private readonly transport;
+    private readonly connector;
     private readonly limits;
     private readonly codecs;
     private readonly defaultTimeoutMs;
@@ -514,47 +488,41 @@ export declare class TransportClient {
     private readonly messageEnqueuedListeners;
     private readonly closeListeners;
     private readonly errorListeners;
+    private readonly activityListeners;
     private readonly retryOpts;
-    /** The CURRENT connection's ownership unit. Replaced atomically on every
-     *  real (re)connect; everything async captures the session it started on
-     *  and is refused once that object is no longer current. */
+    private _state;
     private session;
-    /** Single-flight guard: concurrent `connect()` calls share one attempt,
-     *  so two completion paths can never each install a session (the id-ABA
-     *  the seventh review reproduced). */
+    /** Single-flight connect + its cancellation handle. */
     private connectFlight;
-    private terminated;
+    private connectAbort;
     constructor(options: TransportClientOptions);
+    /** Public lifecycle state: Idle / Connecting / Open / Closing / Stopped. */
+    get state(): TransportState;
+    /** Un-narrowed read for post-await checks (TS narrows `this._state`
+     *  across awaits and mistakes the comparison for dead code). */
+    private stateNow;
+    isConnected(): boolean;
     /**
-     * Open the transport with optional retry-on-failure.
-     *
-     * Idempotent on a live connection, single-flight under concurrency: any
-     * number of overlapping `connect()` calls share ONE attempt and observe
-     * its outcome, and exactly one new session is installed per real
-     * (re)connection.
+     * Open a connection. Single-flight (concurrent calls share one attempt),
+     * idempotent while Open, refused after `shutdown()`, and CANCELLABLE:
+     * `disconnect()`/`shutdown()` abort an in-flight dial, and a dial that
+     * "wins" after cancellation is closed instead of installed.
      */
     connect(): Promise<void>;
     private doConnect;
+    private installSession;
     /**
-     * End the current connection. Reconnecting afterwards is allowed —
-     * this is the "hang up" verb, not the "destroy the client" one.
+     * End the current connection (and cancel a connect in flight). The client
+     * returns to Idle; reconnecting is allowed.
      */
     disconnect(): Promise<void>;
-    /**
-     * Terminal shutdown: disconnects and refuses every future `connect()`.
-     * Use `disconnect()` for a connection you intend to re-establish.
-     */
+    /** Terminal shutdown: disconnects and refuses every future `connect()`. */
     shutdown(): Promise<void>;
-    isConnected(): boolean;
     /**
-     * One-way send. Resolves when the packet was ACCEPTED by the socket's
-     * outbound buffer (enqueue-confirmed — a browser WebSocket offers no
-     * write confirmation, and this API does not pretend otherwise).
-     *
-     * SESSION-BOUND: the send belongs to the connection that was current when
-     * it was CALLED. If the connection turns over while (async) compression
-     * runs, the send is refused — completing it would silently replay a
-     * request the application never chose to retry.
+     * One-way send, enqueue-confirmed, SESSION-BOUND: the send belongs to the
+     * connection that was current when it was CALLED, and its enqueue lands on
+     * that session's link (which rejects once closed) — an async compression
+     * cannot carry it across a reconnect.
      */
     send(payload: Uint8Array, options?: SendOptions): Promise<void>;
     request(payload: Uint8Array, options?: RequestOptions): Promise<Uint8Array>;
@@ -563,60 +531,100 @@ export declare class TransportClient {
     on(event: 'messageEnqueued', cb: (info: EnqueuedInfo) => void): () => void;
     on(event: 'close', cb: (event?: unknown) => void): () => void;
     on(event: 'error', cb: (error: unknown) => void): () => void;
-    private newSession;
+    /**
+     * Liveness tap: fires on any traffic in either direction (inbound message,
+     * request, consumed response; outbound enqueue). Multi-subscriber, so a
+     * heartbeat can track activity without occupying the single request
+     * consumer slot.
+     */
+    observeActivity(cb: () => void): () => void;
     private retireSession;
-    private requireCurrent;
-    private handleIncoming;
+    private handleInbound;
+    private handleLinkClose;
+    private emitClose;
     private route;
     private respondTo;
     private buildOutbound;
-    /** Sync bypass is safe only when there is no codec work AND nothing is
-     *  queued on the session's chain (otherwise this packet would overtake
-     *  it) AND the session is still current. */
     private canBypassChain;
-    /** Synchronous packet construction for the no-compression path. */
-    private buildPlain;
     private scheduleOutbound;
     private dispatchMessageEnqueued;
-    private dispatchClose;
+    private dispatchActivity;
     private dispatchError;
 }
 //# sourceMappingURL=transport-client.d.ts.map
 // ===== transport.d.ts =====
 import type { Packet } from './packet.js';
+/** Public lifecycle states of a `TransportClient`. */
 export declare const TransportState: {
     readonly Idle: "idle";
     readonly Connecting: "connecting";
     readonly Open: "open";
     readonly Closing: "closing";
-    readonly Closed: "closed";
+    /** Terminal: `shutdown()` was called; every later `connect()` is refused. */
+    readonly Stopped: "stopped";
 };
 export type TransportState = (typeof TransportState)[keyof typeof TransportState];
 /**
  * Emitted when a packet has been ACCEPTED by the underlying socket's outbound
  * buffer. Deliberately named "enqueued", not "sent": a browser WebSocket
  * offers no write completion, so nothing at this layer can prove the bytes
- * reached the network. (Rust 2.0's `send` is write-confirmed; this tier is
- * the honest browser equivalent, and pretending otherwise would recreate the
- * fake write confirmations 2.0 was built to kill.)
+ * reached the network.
  */
 export interface EnqueuedInfo {
     messageId: number;
 }
-export interface Transport {
-    connect(): Promise<void>;
-    send(packet: Packet): Promise<void>;
-    close(): Promise<void>;
-    isConnected(): boolean;
-    onMessage(cb: (packet: Packet) => void): void;
-    onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void;
-    onClose(cb: (event?: unknown) => void): void;
-    onError(cb: (error: unknown) => void): void;
+/**
+ * The connection-factory half of the SPI.
+ *
+ * A connector holds CONFIGURATION only — no socket, no writer, no event
+ * handlers, no mutable connection state. Every successful `connect()` returns
+ * a brand-new `TransportSession` that OWNS its physical connection. This is
+ * the structural fix for a whole family of faults the previous shared
+ * `Transport` object produced: an old connection's late events being
+ * attributed to the new one, an old async send writing into the replacement
+ * socket, a stale close reviving state. With per-connection sessions those
+ * are unrepresentable — the old session's events and writes land on the old
+ * session, which is closed.
+ */
+export interface TransportConnector {
+    /**
+     * Dial one connection. `signal` aborting must cancel the attempt: reject
+     * the promise AND release whatever was being established — a connect that
+     * "wins" after the caller gave up must not leave a live socket behind.
+     */
+    connect(options: ConnectOptions): Promise<TransportSession>;
+}
+export interface ConnectOptions {
+    signal: AbortSignal;
+}
+/**
+ * ONE physical connection.
+ *
+ * - `enqueue` resolves when the packet was accepted by THIS connection's
+ *   outbound buffer, and rejects once the session is closed — an enqueue can
+ *   never migrate to a different connection, because the session IS the
+ *   connection.
+ * - `subscribe` delivers this connection's inbound traffic and lifecycle.
+ *   `close` is delivered exactly once; after it, no further events.
+ * - `close()` is idempotent and terminal.
+ */
+export interface TransportSession {
+    enqueue(packet: Packet): Promise<EnqueuedInfo>;
+    subscribe(observer: TransportObserver): () => void;
+    close(reason?: unknown): Promise<void>;
+    isOpen(): boolean;
+}
+export interface TransportObserver {
+    onMessage?(packet: Packet): void;
+    onClose?(info?: unknown): void;
+    /** Non-fatal, connection-scoped errors (protocol violations arrive here
+     *  AND close the session). */
+    onError?(error: unknown): void;
 }
 //# sourceMappingURL=transport.d.ts.map
 // ===== websocket-transport.d.ts =====
-import { type DecodeLimits, Packet } from './packet.js';
-import { type EnqueuedInfo, type Transport, TransportState } from './transport.js';
+import { type DecodeLimits } from './packet.js';
+import type { ConnectOptions, TransportConnector, TransportSession } from './transport.js';
 export interface WebSocketLike {
     binaryType: string;
     readyState: number;
@@ -635,81 +643,45 @@ export interface WebSocketLike {
 }
 export type WebSocketFactory = (url: string, protocols?: string | string[]) => WebSocketLike;
 export type TextFramePolicy = 'error' | 'ignore';
-export interface WebSocketTransportOptions {
+export interface WebSocketConnectorOptions {
     url: string;
     protocols?: string | string[];
-    /**
-     * Override the WebSocket constructor. Defaults to `globalThis.WebSocket`.
-     * Use this to inject `ws` in Node, or a mock in tests.
-     */
+    /** Override the WebSocket constructor. Defaults to `globalThis.WebSocket`. */
     webSocketFactory?: WebSocketFactory;
-    /**
-     * What to do with WebSocket text frames. msgtrans canonical traffic is
-     * Binary-only (see WIRE_FORMAT.md §9.1); a text frame is non-protocol
-     * traffic. Default `'error'`: report and CLOSE the connection (strict,
-     * matching Rust 2.0's frame policy — a desynchronized peer is not
-     * trustworthy). `'ignore'` drops them silently.
-     */
+    /** Text frames are non-protocol traffic. Default `'error'`: report and
+     *  CLOSE (strict). `'ignore'` drops them silently. */
     onTextFrame?: TextFramePolicy;
     /**
-     * Outbound-buffer high-water mark in bytes. `send()` rejects with
-     * `BackpressureError` when the socket's `bufferedAmount` PLUS this frame
-     * would exceed the mark — the projection matters: checking only the
-     * current level let a 10 MiB frame sail through at 15.9/16 MiB. The
-     * connection itself is left open. Default 16 MiB; `0` disables the check.
-     * Sockets that don't report `bufferedAmount` are never rejected.
+     * Outbound-buffer high-water mark in bytes. `enqueue()` rejects with
+     * `BackpressureError` when `bufferedAmount` PLUS this frame would exceed
+     * the mark. The connection stays open. Default 16 MiB; `0` disables.
      */
     maxBufferedBytes?: number;
-    /**
-     * Frame-decoding caps, enforced in BOTH directions with the same numbers
-     * (mirroring Rust 2.0, where one `DecodeLimits` serves every protocol):
-     * inbound frames over the caps close the connection; outbound frames over
-     * the caps are rejected here instead of letting the server kill the
-     * connection over them. Defaults match the Rust defaults.
-     */
+    /** Frame caps, both directions. Defaults mirror the Rust 2.0 defaults. */
     limits?: Partial<DecodeLimits>;
 }
 /** Default outbound high-water mark: 16 MiB. */
 export declare const DEFAULT_MAX_BUFFERED_BYTES: number;
-export declare class WebSocketTransport implements Transport {
+/**
+ * WebSocket connector: CONFIGURATION only. Every `connect()` dials a fresh
+ * socket and hands it to a brand-new `WebSocketSession` that owns it — there
+ * is no shared mutable connection state for a late event to revive or an old
+ * send to leak through. (The previous shared-Transport shape produced exactly
+ * those faults: a late onopen flipping Closed back to Open, an old socket's
+ * traffic delivered as the new one's.)
+ */
+export declare class WebSocketConnector implements TransportConnector {
     private readonly opts;
     private readonly limits;
-    private ws;
-    private _state;
-    private readonly messageHandlers;
-    private readonly messageEnqueuedHandlers;
-    private readonly closeHandlers;
-    private readonly errorHandlers;
-    private connectPromise;
-    private connectResolve;
-    private connectReject;
-    constructor(opts: WebSocketTransportOptions);
-    get state(): TransportState;
-    isConnected(): boolean;
-    connect(): Promise<void>;
-    send(packet: Packet): Promise<void>;
-    close(): Promise<void>;
-    onMessage(cb: (packet: Packet) => void): void;
-    onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void;
-    onClose(cb: (event?: unknown) => void): void;
-    onError(cb: (error: unknown) => void): void;
-    private handleMessage;
-    private decodeAndDispatch;
-    /** Report a protocol violation and close: strict framing has no
-     *  keep-going path. */
-    private fatal;
-    private handleError;
-    private handleClose;
-    private dispatchError;
+    constructor(opts: WebSocketConnectorOptions);
+    connect(options: ConnectOptions): Promise<TransportSession>;
 }
 //# sourceMappingURL=websocket-transport.d.ts.map
 // ===== webtransport-transport.d.ts =====
-import { type DecodeLimits, Packet } from './packet.js';
-import { type EnqueuedInfo, type Transport, TransportState } from './transport.js';
-/**
- * The subset of the WebTransport API this adapter needs — injectable so
- * tests (and non-browser hosts) can supply a fake.
- */
+import { type DecodeLimits } from './packet.js';
+import type { ConnectOptions, TransportConnector, TransportSession } from './transport.js';
+/** The subset of the WebTransport API this adapter needs — injectable so
+ *  tests (and non-browser hosts) can supply a fake. */
 export interface WebTransportLike {
     readonly ready: Promise<void>;
     readonly closed: Promise<unknown>;
@@ -723,7 +695,7 @@ export interface WebTransportLike {
     }>;
 }
 export type WebTransportFactory = (url: string) => WebTransportLike;
-export interface WebTransportTransportOptions {
+export interface WebTransportConnectorOptions {
     /** https:// URL of the WebTransport endpoint. */
     url: string;
     /** Override the WebTransport constructor. Defaults to
@@ -733,52 +705,15 @@ export interface WebTransportTransportOptions {
     limits?: Partial<DecodeLimits>;
 }
 /**
- * msgtrans over WebTransport (HTTP/3).
- *
- * Framing mirrors the Rust QUIC adapter so the two can interoperate the day
- * a server exposes a WebTransport endpoint: ONE bidirectional stream per
- * connection, each msgtrans frame preceded by a 4-byte big-endian length.
- * The stream is a byte stream (unlike WebSocket's message framing), so this
- * adapter owns reassembly: partial prefixes, partial frames and multiple
- * frames per chunk are all normal.
- *
- * Semantics match the WebSocket adapter exactly:
- * - `send()` resolves when the chunk was ACCEPTED by the stream writer
- *   (enqueue-confirmed; the writer's promise is the platform's own
- *   backpressure, so no separate high-water mark is layered on top).
- * - Strict inbound: an over-limit length prefix or an undecodable frame
- *   closes the connection.
- * - `ReservedFlag.Fragmented` is refused (nothing implements reassembly).
- * - Generation isolation: a previous session's late readable/closed events
- *   cannot act on the replacement connection.
+ * WebTransport connector (EXPERIMENTAL): configuration only. Each connect
+ * dials a fresh HTTP/3 session and returns a `WebTransportSession` that owns
+ * it. Framing mirrors the Rust QUIC adapter — one bidirectional stream,
+ * 4-byte big-endian length prefix per msgtrans frame.
  */
-export declare class WebTransportTransport implements Transport {
+export declare class WebTransportConnector implements TransportConnector {
     private readonly opts;
     private readonly limits;
-    private session;
-    private writer;
-    private _state;
-    private readonly messageHandlers;
-    private readonly messageEnqueuedHandlers;
-    private readonly closeHandlers;
-    private readonly errorHandlers;
-    constructor(opts: WebTransportTransportOptions);
-    get state(): TransportState;
-    isConnected(): boolean;
-    connect(): Promise<void>;
-    send(packet: Packet): Promise<void>;
-    close(): Promise<void>;
-    onMessage(cb: (packet: Packet) => void): void;
-    onMessageEnqueued(cb: (info: EnqueuedInfo) => void): void;
-    onClose(cb: (event?: unknown) => void): void;
-    onError(cb: (error: unknown) => void): void;
-    /**
-     * Reassemble length-prefixed frames from the byte stream and dispatch
-     * strictly decoded packets. Every protocol violation is fatal.
-     */
-    private readLoop;
-    private fatal;
-    private handleClose;
-    private dispatchError;
+    constructor(opts: WebTransportConnectorOptions);
+    connect(options: ConnectOptions): Promise<TransportSession>;
 }
 //# sourceMappingURL=webtransport-transport.d.ts.map
