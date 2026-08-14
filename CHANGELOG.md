@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.6.2-beta.0 — 2026-08-14
+
+**Final supervisor closure + API freeze prep** (tenth review).
+
+### Fixed
+
+- A `connect()` issued right after `disconnect()` cancelled an in-flight
+  dial no longer receives the doomed old flight: a cancelled single-flight
+  is never shared — the new intent queues behind it and dials fresh.
+- Session installation is an exception-safe transaction: a throwing
+  `subscribe()` rolls back current, retires the session AND closes the
+  physical link; a close replayed synchronously during `subscribe()` no
+  longer leaks the observer registration (`setUnsubscribe` runs the handle
+  immediately when the session already retired).
+- `disconnect()`/`shutdown()` PROPAGATE an underlying
+  `TransportSession.close()` failure after converging state in `finally` —
+  a broken close is no longer reported as success over a possibly-open
+  session (the error also still surfaces on `'error'`).
+
+### Breaking (pre-freeze cleanup; nothing published on npm yet)
+
+- Removed the deprecated `transport` option — the public name is
+  `connector`.
+- Typed close everywhere: new `TransportCloseEvent`
+  (`{ intentional, reason?, code?, cause? }`).
+  `TransportSession.close(event?: Partial<TransportCloseEvent>)`,
+  `TransportObserver.onClose(event: TransportCloseEvent)`, and the client's
+  `'close'` event all use it; sessions normalize platform close shapes.
+
+### Infra
+
+- `prepublishOnly` now runs `test:e2e:all` (13 Rust-interop tests), not the
+  8-test subset.
+- Downstream `@privchat/sdk` peer range moved to `^0.6.2-beta.0` and the
+  pairing was verified via packed tarballs (`npm pack` + real install), not
+  only `file:` links.
+
 ## 0.6.1-beta.0 — 2026-08-14
 
 **Serialized lifecycle supervisor** (ninth review). `connect()`,

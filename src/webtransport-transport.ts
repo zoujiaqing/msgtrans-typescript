@@ -8,6 +8,7 @@ import { DecodeLimitError, TransportError, WireFormatError } from './errors.js';
 import type {
   ConnectOptions,
   EnqueuedInfo,
+  TransportCloseEvent,
   TransportConnector,
   TransportObserver,
   TransportSession,
@@ -120,10 +121,11 @@ class WebTransportSession implements TransportSession {
     this.writer = stream.writable.getWriter();
     void this.readLoop(stream.readable);
     void wt.closed.then(
-      (info) => this.handleClose(info),
+      (info) =>
+        this.handleClose({ intentional: false, reason: 'closed', cause: info }),
       (e) => {
         this.dispatchError(e);
-        this.handleClose(e);
+        this.handleClose({ intentional: false, reason: 'closed', cause: e });
       },
     );
   }
@@ -157,14 +159,14 @@ class WebTransportSession implements TransportSession {
     };
   }
 
-  close(reason?: unknown): Promise<void> {
+  close(event?: Partial<TransportCloseEvent>): Promise<void> {
     if (!this.open) return Promise.resolve();
     try {
       this.wt.close();
     } catch {
       /* deterministic close below still runs */
     }
-    this.handleClose(reason ?? { reason: 'closed locally' });
+    this.handleClose({ intentional: true, reason: 'closed locally', ...event });
     return Promise.resolve();
   }
 
@@ -179,7 +181,7 @@ class WebTransportSession implements TransportSession {
         const { done, value } = await reader.read();
         if (!this.open) return;
         if (done) {
-          this.handleClose({ reason: 'stream ended' });
+          this.handleClose({ intentional: false, reason: 'stream ended' });
           return;
         }
         buffer = concat(buffer, value);
@@ -220,7 +222,7 @@ class WebTransportSession implements TransportSession {
     } catch (e) {
       if (this.open) {
         this.dispatchError(e);
-        this.handleClose(e);
+        this.handleClose({ intentional: false, reason: 'read failed', cause: e });
       }
     } finally {
       reader.releaseLock();
@@ -229,10 +231,10 @@ class WebTransportSession implements TransportSession {
 
   private fatal(e: unknown): void {
     this.dispatchError(e);
-    void this.close({ reason: 'protocol violation', cause: e });
+    void this.close({ intentional: false, reason: 'protocol violation', cause: e });
   }
 
-  private handleClose(ev: unknown): void {
+  private handleClose(ev: TransportCloseEvent): void {
     if (!this.open) return;
     this.open = false;
     for (const o of [...this.observers]) {

@@ -49,6 +49,19 @@ export interface ConnectOptions {
 }
 
 /**
+ * The one close-notification shape, both at the session SPI and on the
+ * client's `'close'` event. `intentional` distinguishes "this side asked for
+ * the close" (disconnect/shutdown/session.close) from a peer- or
+ * network-initiated end — the signal reconnect machines key on.
+ */
+export interface TransportCloseEvent {
+  intentional: boolean;
+  reason?: string;
+  code?: number;
+  cause?: unknown;
+}
+
+/**
  * ONE physical connection.
  *
  * - `enqueue` resolves when the packet was accepted by THIS connection's
@@ -57,18 +70,19 @@ export interface ConnectOptions {
  *   connection.
  * - `subscribe` delivers this connection's inbound traffic and lifecycle.
  *   `close` is delivered exactly once; after it, no further events.
- * - `close()` is idempotent and terminal.
+ * - `close()` is idempotent and terminal. The session fills in defaults for
+ *   fields the caller omits (a bare `close()` is an intentional close).
  */
 export interface TransportSession {
   enqueue(packet: Packet): Promise<EnqueuedInfo>;
   subscribe(observer: TransportObserver): () => void;
-  close(reason?: unknown): Promise<void>;
+  close(event?: Partial<TransportCloseEvent>): Promise<void>;
   isOpen(): boolean;
 }
 
 export interface TransportObserver {
   onMessage?(packet: Packet): void;
-  onClose?(info?: unknown): void;
+  onClose?(event: TransportCloseEvent): void;
   /** Non-fatal, connection-scoped errors (protocol violations arrive here
    *  AND close the session). */
   onError?(error: unknown): void;

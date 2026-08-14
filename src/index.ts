@@ -12,6 +12,7 @@ export { TransportState } from './transport.js';
 export type {
   ConnectOptions,
   EnqueuedInfo,
+  TransportCloseEvent,
   TransportConnector,
   TransportObserver,
   TransportSession,

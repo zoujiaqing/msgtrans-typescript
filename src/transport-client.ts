@@ -10,6 +10,7 @@ import { CodecRegistry, type CompressionCodec, ZlibCodec } from './codec.js';
 import { InboundNormalizer } from './inbound-normalizer.js';
 import {
   type EnqueuedInfo,
+  type TransportCloseEvent,
   type TransportConnector,
   type TransportSession,
   TransportState,
@@ -49,8 +50,6 @@ export interface TransportClientOptions {
   /** A custom connection factory; defaults to `WebSocketConnector` built
    *  from `url` + the WebSocket options below. */
   connector?: TransportConnector;
-  /** @deprecated Use `connector`. (`'websocket'` is the default behavior.) */
-  transport?: 'websocket' | TransportConnector;
   protocols?: string | string[];
   webSocketFactory?: WebSocketFactory;
   onTextFrame?: TextFramePolicy;
@@ -128,7 +127,7 @@ class ClientSession {
   readonly manager: RequestManager;
   readonly normalizer: InboundNormalizer;
   readonly abort = new AbortController();
-  unsubscribe: (() => void) | null = null;
+  private unsubscribe: (() => void) | null = null;
   outboundChain: Promise<void> = Promise.resolve();
   outboundFrames = 0;
   outboundBytes = 0;
@@ -151,11 +150,23 @@ class ClientSession {
     );
   }
 
+  /** If the session already retired (a close replayed synchronously inside
+   *  subscribe(), before the handle existed), run it NOW — never leak the
+   *  observer registration. */
+  setUnsubscribe(fn: () => void): void {
+    if (this.closed) {
+      fn();
+      return;
+    }
+    this.unsubscribe = fn;
+  }
+
   retire(reason: TransportError): void {
     if (this.closed) return;
     this.closed = true;
     this.abort.abort(); // release hung codec work and its memory
     this.unsubscribe?.();
+    this.unsubscribe = null;
     this.manager.reset(reason);
   }
 }
@@ -172,7 +183,8 @@ export class TransportClient {
   private requestListener: ((req: ClientRequest) => void) | null = null;
   private readonly messageEnqueuedListeners: Array<(info: EnqueuedInfo) => void> =
     [];
-  private readonly closeListeners: Array<(event?: unknown) => void> = [];
+  private readonly closeListeners: Array<(event: TransportCloseEvent) => void> =
+    [];
   private readonly errorListeners: Array<(error: unknown) => void> = [];
   private readonly activityListeners: Array<() => void> = [];
   private readonly retryOpts: Required<ConnectRetryOptions>;
@@ -267,10 +279,21 @@ export class TransportClient {
       return Promise.reject(new TransportError('client is shut down'));
     }
     if (this.isConnected()) return Promise.resolve();
-    if (this.connectFlight) return this.connectFlight;
+    if (
+      this.connectFlight &&
+      this.connectAbort &&
+      !this.connectAbort.signal.aborted
+    ) {
+      // A LIVE single-flight is shared. A cancelled one is not: it is doomed
+      // to reject, and handing it to a caller who wants a NEW connection
+      // would swallow their intent — queue behind it instead.
+      return this.connectFlight;
+    }
+    const previous = this.connectFlight;
     const abort = new AbortController();
     this.connectAbort = abort;
     const flight = (async () => {
+      if (previous) await previous.catch(() => {});
       // Serialize behind an in-progress disconnect/shutdown: the dial starts
       // only after the close has fully converged, so a finishing close can
       // never stomp the state a fresh connect just wrote.
@@ -319,7 +342,9 @@ export class TransportClient {
         // shutdown() aborted it must not install anything — close the
         // connection it won and report cancellation.
         if (abort.signal.aborted || this.stateNow() === TransportState.Stopped) {
-          await link.close({ reason: 'connect aborted' });
+          await link
+            .close({ intentional: true, reason: 'connect aborted' })
+            .catch(() => {});
           throw new TransportError('connect aborted');
         }
         this.installSession(link);
@@ -360,16 +385,33 @@ export class TransportClient {
     // replays a close during subscribe() must be recognized as current so
     // the close handler retires it — not mistaken for a stale link's echo.
     this.session = session;
-    // The observer is bound to THIS session: an old link's late events act
-    // on the old (retired) session and stop there — by construction, not by
-    // a generation check someone has to remember.
-    session.unsubscribe = link.subscribe({
-      onMessage: (packet) => this.handleInbound(session, packet),
-      onClose: (ev) => this.handleLinkClose(session, ev),
-      onError: (e) => {
-        if (session === this.session && !session.closed) this.dispatchError(e);
-      },
-    });
+    // Installation is a TRANSACTION: subscribe() is a public-SPI call that
+    // may throw or synchronously replay a close; every failure path must
+    // roll back current, retire the session AND release the physical link.
+    let unsubscribe: () => void;
+    try {
+      // The observer is bound to THIS session: an old link's late events act
+      // on the old (retired) session and stop there — by construction, not
+      // by a generation check someone has to remember.
+      unsubscribe = link.subscribe({
+        onMessage: (packet) => this.handleInbound(session, packet),
+        onClose: (ev) => this.handleLinkClose(session, ev),
+        onError: (e) => {
+          if (session === this.session && !session.closed)
+            this.dispatchError(e);
+        },
+      });
+    } catch (e) {
+      if (this.session === session) this.session = null;
+      session.retire(new TransportError('subscribe failed'));
+      void link
+        .close({ intentional: true, reason: 'subscribe failed', cause: e })
+        .catch(() => {});
+      throw e instanceof Error ? e : new TransportError(String(e));
+    }
+    // Runs immediately when the session already retired during subscribe():
+    // the observer registration must not outlive the session.
+    session.setUnsubscribe(unsubscribe);
     if (session.closed || !link.isOpen()) {
       // The link died during installation (a synchronous close replay was
       // already handled above); this connect attempt FAILED — never report
@@ -445,9 +487,13 @@ export class TransportClient {
   private beginClose(session: ClientSession, reason: string): Promise<void> {
     const flight = (async () => {
       try {
-        await session.link.close({ reason });
+        await session.link.close({ intentional: true, reason });
       } catch (e) {
+        // Converge in finally FIRST, then let the caller of disconnect()/
+        // shutdown() see the failure — a broken close() must not be silently
+        // reported as success while the physical session may still be open.
         this.dispatchError(e);
+        throw e instanceof Error ? e : new TransportError(String(e));
       } finally {
         if (this.stateNow() === TransportState.Closing) {
           this._state = TransportState.Idle;
@@ -524,7 +570,7 @@ export class TransportClient {
   on(event: 'message', cb: (msg: ClientMessage) => void): () => void;
   on(event: 'request', cb: (req: ClientRequest) => void): () => void;
   on(event: 'messageEnqueued', cb: (info: EnqueuedInfo) => void): () => void;
-  on(event: 'close', cb: (event?: unknown) => void): () => void;
+  on(event: 'close', cb: (event: TransportCloseEvent) => void): () => void;
   on(event: 'error', cb: (error: unknown) => void): () => void;
   on(
     event: ClientEvent,
@@ -532,7 +578,7 @@ export class TransportClient {
       | ((msg: ClientMessage) => void)
       | ((req: ClientRequest) => void)
       | ((info: EnqueuedInfo) => void)
-      | ((event?: unknown) => void)
+      | ((event: TransportCloseEvent) => void)
       | ((error: unknown) => void),
   ): () => void {
     if (event === 'message') {
@@ -561,7 +607,7 @@ export class TransportClient {
       return () => removeFrom(this.messageEnqueuedListeners, fn);
     }
     if (event === 'close') {
-      const fn = cb as (event?: unknown) => void;
+      const fn = cb as (event: TransportCloseEvent) => void;
       this.closeListeners.push(fn);
       return () => removeFrom(this.closeListeners, fn);
     }
@@ -601,12 +647,14 @@ export class TransportClient {
       (e) => {
         if (session.closed) return;
         this.dispatchError(e);
-        void session.link.close({ reason: 'protocol violation' });
+        void session.link
+          .close({ intentional: false, reason: 'protocol violation', cause: e })
+          .catch(() => {});
       },
     );
   }
 
-  private handleLinkClose(session: ClientSession, ev: unknown): void {
+  private handleLinkClose(session: ClientSession, ev: TransportCloseEvent): void {
     const wasCurrent = session === this.session;
     session.retire(new TransportError('transport closed'));
     if (!wasCurrent) return; // an old link's close is its own business
@@ -622,7 +670,7 @@ export class TransportClient {
     this.emitClose(ev);
   }
 
-  private emitClose(ev: unknown): void {
+  private emitClose(ev: TransportCloseEvent): void {
     for (const cb of [...this.closeListeners]) {
       try {
         cb(ev);
@@ -881,9 +929,6 @@ function buildPlain(
 
 function resolveConnector(options: TransportClientOptions): TransportConnector {
   if (options.connector) return options.connector;
-  if (options.transport && typeof options.transport === 'object') {
-    return options.transport;
-  }
   if (!options.url) {
     throw new TransportError(
       'TransportClient requires either `url` (for the default WebSocket connector) or a `connector`',

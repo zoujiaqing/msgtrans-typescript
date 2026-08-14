@@ -3,6 +3,7 @@ import {
   TransportError,
   type ConnectOptions,
   type EnqueuedInfo,
+  type TransportCloseEvent,
   type TransportConnector,
   type TransportObserver,
   type TransportSession,
@@ -39,12 +40,12 @@ export class FakeSession implements TransportSession {
     };
   }
 
-  close(reason?: unknown): Promise<void> {
+  close(event?: Partial<TransportCloseEvent>): Promise<void> {
     this.closeCalls += 1;
     if (this.open) {
       this.open = false;
       for (const o of [...this.observers])
-        o.onClose?.(reason ?? { reason: 'closed' });
+        o.onClose?.({ intentional: true, reason: 'closed', ...event });
     }
     return Promise.resolve();
   }
@@ -52,10 +53,11 @@ export class FakeSession implements TransportSession {
   fireMessage(packet: Packet): void {
     for (const o of [...this.observers]) o.onMessage?.(packet);
   }
-  fireClose(ev?: unknown): void {
+  fireClose(ev?: Partial<TransportCloseEvent>): void {
     if (!this.open) return;
     this.open = false;
-    for (const o of [...this.observers]) o.onClose?.(ev);
+    for (const o of [...this.observers])
+      o.onClose?.({ intentional: false, ...ev });
   }
   fireError(e: unknown): void {
     for (const o of [...this.observers]) o.onError?.(e);
@@ -112,7 +114,7 @@ export class FakeTransport implements TransportConnector {
   fireMessage(packet: Packet): void {
     this.sessions[this.sessions.length - 1]?.fireMessage(packet);
   }
-  fireClose(ev?: unknown): void {
+  fireClose(ev?: Partial<TransportCloseEvent>): void {
     this.sessions[this.sessions.length - 1]?.fireClose(ev);
   }
   fireError(e: unknown): void {

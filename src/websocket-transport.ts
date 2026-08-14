@@ -12,6 +12,7 @@ import {
 import type {
   ConnectOptions,
   EnqueuedInfo,
+  TransportCloseEvent,
   TransportConnector,
   TransportObserver,
   TransportSession,
@@ -178,7 +179,7 @@ class WebSocketSession implements TransportSession {
     // handler firing after close is harmless: `open` gates every path.
     ws.onmessage = (ev) => this.handleMessage(ev);
     ws.onerror = (ev) => this.dispatchError(ev);
-    ws.onclose = (ev) => this.handleClose(ev);
+    ws.onclose = (ev) => this.handleClose(platformClose(ev));
   }
 
   isOpen(): boolean {
@@ -222,9 +223,9 @@ class WebSocketSession implements TransportSession {
         // the owner reacts immediately (idempotent — the real onclose is a
         // no-op afterwards).
         this.handleClose({
+          intentional: false,
           code: 1006,
           reason: 'send failed on dead socket',
-          wasClean: false,
           cause: e,
         });
       }
@@ -241,7 +242,7 @@ class WebSocketSession implements TransportSession {
     };
   }
 
-  close(reason?: unknown): Promise<void> {
+  close(event?: Partial<TransportCloseEvent>): Promise<void> {
     if (!this.open) return Promise.resolve();
     try {
       this.ws.close();
@@ -249,7 +250,11 @@ class WebSocketSession implements TransportSession {
       /* the deterministic close below still runs */
     }
     // Deterministic: do not depend on the platform ever firing onclose.
-    this.handleClose(reason ?? { reason: 'closed locally' });
+    this.handleClose({
+      intentional: true,
+      reason: 'closed locally',
+      ...event,
+    });
     return Promise.resolve();
   }
 
@@ -301,10 +306,12 @@ class WebSocketSession implements TransportSession {
 
   private fatal(e: unknown): void {
     this.dispatchError(e);
-    void this.close({ reason: 'protocol violation', cause: e });
+    // Locally driven but NOT requested by the owner: a violation close is
+    // unintentional from the consumer's point of view.
+    void this.close({ intentional: false, reason: 'protocol violation', cause: e });
   }
 
-  private handleClose(ev: unknown): void {
+  private handleClose(ev: TransportCloseEvent): void {
     if (!this.open) return;
     this.open = false;
     for (const o of [...this.observers]) {
@@ -326,4 +333,15 @@ class WebSocketSession implements TransportSession {
       }
     }
   }
+}
+
+/** Normalize a platform CloseEvent into the SPI close shape. */
+function platformClose(ev: unknown): TransportCloseEvent {
+  const e = ev as { code?: number; reason?: string } | null | undefined;
+  return {
+    intentional: false,
+    code: typeof e?.code === 'number' ? e.code : undefined,
+    reason: typeof e?.reason === 'string' ? e.reason : undefined,
+    cause: ev,
+  };
 }

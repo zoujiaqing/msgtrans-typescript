@@ -34,7 +34,12 @@ class ManualSession implements TransportSession {
   constructor(
     readonly closeMode: CloseMode,
     private readonly syncReplayCloseOnSubscribe: boolean,
+    private readonly subscribeError: Error | null = null,
   ) {}
+
+  get observerCount(): number {
+    return this.observers.length;
+  }
 
   isOpen(): boolean {
     return this.open;
@@ -46,12 +51,13 @@ class ManualSession implements TransportSession {
   }
 
   subscribe(observer: TransportObserver): () => void {
+    if (this.subscribeError) throw this.subscribeError;
     this.observers.push(observer);
     if (this.syncReplayCloseOnSubscribe && this.open) {
       // The hostile case: the close is replayed SYNCHRONOUSLY inside
       // subscribe(), before the caller's next line runs.
       this.open = false;
-      observer.onClose?.({ reason: 'sync replay' });
+      observer.onClose?.({ intentional: false, reason: 'sync replay' });
     }
     return () => {
       const i = this.observers.indexOf(observer);
@@ -62,7 +68,8 @@ class ManualSession implements TransportSession {
   close(): Promise<void> {
     this.closeCalls += 1;
     if (this.closeMode === 'reject') {
-      this.open = false;
+      // Deliberately STAYS open: a close() that both rejects and leaves the
+      // physical connection up is the harshest misbehaving-SPI shape.
       return Promise.reject(new Error('close exploded'));
     }
     if (this.closeMode === 'resolve') {
@@ -87,13 +94,31 @@ class ManualConnector implements TransportConnector {
   readonly sessions: ManualSession[] = [];
   nextCloseMode: CloseMode = 'resolve';
   nextSyncReplay = false;
+  nextSubscribeError: Error | null = null;
+  nextDialPending = false;
   connectError: Error | null = null;
+  connectCalls = 0;
 
-  async connect(_options: ConnectOptions): Promise<TransportSession> {
-    if (this.connectError) throw this.connectError;
-    const session = new ManualSession(this.nextCloseMode, this.nextSyncReplay);
+  connect(options: ConnectOptions): Promise<TransportSession> {
+    this.connectCalls += 1;
+    if (this.connectError) return Promise.reject(this.connectError);
+    if (this.nextDialPending) {
+      // A dial that never completes on its own but honors cancellation.
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener(
+          'abort',
+          () => reject(new TransportError('connect aborted')),
+          { once: true },
+        );
+      });
+    }
+    const session = new ManualSession(
+      this.nextCloseMode,
+      this.nextSyncReplay,
+      this.nextSubscribeError,
+    );
     this.sessions.push(session);
-    return session;
+    return Promise.resolve(session);
   }
 }
 
@@ -164,6 +189,9 @@ describe('lifecycle supervisor', () => {
     // A session that never became Open emits no close event; the connect()
     // rejection is the report.
     expect(closeEvents).toHaveLength(0);
+    // And the observer registration did not leak: retire ran before the
+    // unsubscribe handle existed, so setUnsubscribe executed it immediately.
+    expect(connector.sessions[0]!.observerCount).toBe(0);
 
     // The client recovers: a healthy dial afterwards works.
     connector.nextSyncReplay = false;
@@ -171,7 +199,7 @@ describe('lifecycle supervisor', () => {
     expect(client.isConnected()).toBe(true);
   });
 
-  it('a rejecting session.close() cannot strand the client in Closing; close still notifies exactly once', async () => {
+  it('a rejecting session.close() cannot strand the client in Closing; the failure is PROPAGATED, close still notifies exactly once', async () => {
     const connector = new ManualConnector();
     connector.nextCloseMode = 'reject';
     const client = new TransportClient({ connector });
@@ -181,7 +209,9 @@ describe('lifecycle supervisor', () => {
     client.on('close', (ev) => closeEvents.push(ev));
     client.on('error', (e) => errors.push(e));
 
-    await client.disconnect();
+    // The caller SEES the failure — never success over a possibly-open link.
+    await expect(client.disconnect()).rejects.toThrow('close exploded');
+    // ...but the state still converged (finally), with exactly one close event.
     expect(client.state).toBe(TransportState.Idle);
     expect(closeEvents).toHaveLength(1);
     expect(closeEvents[0]).toMatchObject({ intentional: true });
@@ -189,6 +219,55 @@ describe('lifecycle supervisor', () => {
 
     // Still reconnectable after the misbehaving close.
     connector.nextCloseMode = 'resolve';
+    await client.connect();
+    expect(client.isConnected()).toBe(true);
+  });
+
+  it('shutdown() propagates a close failure instead of reporting success over an open session', async () => {
+    const connector = new ManualConnector();
+    connector.nextCloseMode = 'reject';
+    const client = new TransportClient({ connector });
+    await client.connect();
+    const first = connector.sessions[0]!;
+
+    await expect(client.shutdown()).rejects.toThrow('close exploded');
+    // State converged to Stopped, the session is truthfully still open — and
+    // the caller KNOWS, because shutdown() rejected.
+    expect(client.state).toBe(TransportState.Stopped);
+    expect(first.isOpen()).toBe(true);
+    await expect(client.connect()).rejects.toThrow('shut down');
+  });
+
+  it('a new connect() after cancelling an in-flight dial is not swallowed by the doomed flight', async () => {
+    const connector = new ManualConnector();
+    connector.nextDialPending = true;
+    const client = new TransportClient({ connector });
+    const p1 = client.connect();
+    p1.catch(() => {});
+    await flush(); // dial 1 is in flight
+
+    const disc = client.disconnect(); // cancels dial 1
+    connector.nextDialPending = false;
+    const p2 = client.connect(); // fresh intent — must NOT be the doomed p1
+    await expect(p1).rejects.toThrow('connect aborted');
+    await disc;
+    await p2;
+    expect(client.isConnected()).toBe(true);
+    expect(connector.connectCalls).toBe(2);
+  });
+
+  it('a throwing subscribe() rolls the installation back and closes the physical link', async () => {
+    const connector = new ManualConnector();
+    connector.nextSubscribeError = new Error('subscribe exploded');
+    const client = new TransportClient({ connector });
+
+    await expect(client.connect()).rejects.toThrow('subscribe exploded');
+    expect(client.state).toBe(TransportState.Idle);
+    const first = connector.sessions[0]!;
+    expect(first.closeCalls).toBe(1);
+    expect(first.isOpen()).toBe(false);
+
+    connector.nextSubscribeError = null;
     await client.connect();
     expect(client.isConnected()).toBe(true);
   });
@@ -209,14 +288,6 @@ describe('lifecycle supervisor', () => {
     await client.disconnect();
     await expect(attempt).rejects.toThrow();
     expect(client.state).toBe(TransportState.Idle);
-  });
-
-  it('the deprecated `transport` option still resolves a custom connector', async () => {
-    const connector = new ManualConnector();
-    const client = new TransportClient({ transport: connector });
-    await client.connect();
-    expect(client.isConnected()).toBe(true);
-    expect(connector.sessions).toHaveLength(1);
   });
 
   it('WebTransport abort wins even when the platform never settles ready or createBidirectionalStream', async () => {

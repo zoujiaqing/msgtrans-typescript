@@ -4,7 +4,7 @@ TypeScript client runtime for the [msgtrans](https://github.com/zoujiaqing/msgtr
 
 `@msgtrans/client` is the language mapping of the `msgtrans` Rust client surface — same Packet semantics, same Request/Response correlation rules, same wire bytes. The wire format is defined by [`WIRE_FORMAT.md`](https://github.com/zoujiaqing/msgtrans/blob/main/docs/WIRE_FORMAT.md) and conformance is verified by a shared cross-language fixture suite.
 
-> **Status: 0.6.1-beta.0** — Connector/Session SPI with a serialized lifecycle supervisor: per-connection ownership at the public boundary, strict decode, transport-owned message ids, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
+> **Status: 0.6.2-beta.0** — Connector/Session SPI with a serialized lifecycle supervisor: per-connection ownership at the public boundary, strict decode, transport-owned message ids, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
 >
 > **Compatibility matrix**
 >
@@ -136,7 +136,7 @@ client.request(payload: Uint8Array, options?: RequestOptions): Promise<Uint8Arra
 client.on('message',         (msg: ClientMessage) => void): () => void;
 client.on('request',         (req: ClientRequest) => void): () => void;
 client.on('messageEnqueued', (info: { messageId: number }) => void): () => void;
-client.on('close',           (event?: unknown) => void): () => void;
+client.on('close',           (event: TransportCloseEvent) => void): () => void;
 client.on('error',           (error: unknown) => void): () => void;
 ```
 
@@ -209,7 +209,7 @@ Cross-language conformance is enforced: every release runs the same fixture set 
 
 - [x] **0.1.0-beta** — wire format, WebSocket transport, request/response, server-push handling
 - [x] **0.2.0-beta** — 2.0 semantic alignment: strict decode + `DecodeLimits`, transport-owned ids (no wrap), socket & respond generations, serialized inbound normalization, zlib via native streams, codec SPI (zstd injectable), honest enqueue tier, projected backpressure, API surface shrink
-- [x] **0.3.0-beta** — `HeartbeatMonitor` (caller-supplied probe, idle-based), `ReconnectManager` (backoff + jitter, blunt stop-first contract), `WebTransportTransport`
+- [x] **0.3.0-beta** — `HeartbeatMonitor` (caller-supplied probe, idle-based), `ReconnectManager` (backoff + jitter, blunt stop-first contract), `WebTransportConnector`
 - [x] **0.4.0-beta** — lifecycle hardening: idempotent `connect()`, generation-bound + poisoned + bounded inbound normalization, cancel-safe connect/close, sealed `ClientMessage`/`ClientRequest` handles, strict config validation. **WebTransport moved to `@msgtrans/client/experimental`** until a real server interop E2E exists.
 - [ ] later — Zstd codec package, WebTransport server interop E2E (needs a server endpoint)
 

@@ -1,7 +1,7 @@
 {
   "name": "@msgtrans/client",
-  "version": "0.6.1-beta.0",
-  "description": "TypeScript client runtime for the msgtrans wire protocol \u2014 browser-first; WebSocket transport, zlib compression, heartbeat/reconnect helpers, experimental WebTransport.",
+  "version": "0.6.2-beta.0",
+  "description": "TypeScript client runtime for the msgtrans wire protocol — browser-first; WebSocket transport, zlib compression, heartbeat/reconnect helpers, experimental WebTransport.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -30,7 +30,7 @@
     "test:e2e:official": "vitest run --config vitest.e2e.config.ts tests/e2e/official-echo-server.test.ts",
     "test:e2e:all": "vitest run --config vitest.e2e.config.ts",
     "sync-fixtures": "node scripts/sync-fixtures.mjs",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run api-report && git diff --exit-code api-report.txt && npm run test:e2e",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run api-report && git diff --exit-code api-report.txt && npm run test:e2e:all",
     "api-report": "node scripts/gen-api-report.mjs"
   },
   "devDependencies": {

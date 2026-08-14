@@ -278,7 +278,7 @@ describe('TransportClient — close / error events', () => {
     const closes: unknown[] = [];
     c.on('close', (ev) => closes.push(ev));
     t.fireClose({ code: 1001 });
-    expect(closes).toEqual([{ code: 1001 }]);
+    expect(closes).toEqual([{ intentional: false, code: 1001 }]);
   });
 
   it('error event propagates to listeners', async () => {
