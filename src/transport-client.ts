@@ -48,6 +48,8 @@ export interface TransportClientOptions {
   url?: string;
   /** A custom connection factory; defaults to `WebSocketConnector` built
    *  from `url` + the WebSocket options below. */
+  connector?: TransportConnector;
+  /** @deprecated Use `connector`. (`'websocket'` is the default behavior.) */
   transport?: 'websocket' | TransportConnector;
   protocols?: string | string[];
   webSocketFactory?: WebSocketFactory;
@@ -180,6 +182,10 @@ export class TransportClient {
   /** Single-flight connect + its cancellation handle. */
   private connectFlight: Promise<void> | null = null;
   private connectAbort: AbortController | null = null;
+  /** Single-flight close (disconnect/shutdown). While it is pending, no dial
+   *  may start and no other lifecycle op may touch the state — the three
+   *  operations are SERIALIZED, never interleaved. */
+  private closeFlight: Promise<void> | null = null;
 
   constructor(options: TransportClientOptions) {
     this.limits = normalizeDecodeLimits(options.limits);
@@ -264,7 +270,19 @@ export class TransportClient {
     if (this.connectFlight) return this.connectFlight;
     const abort = new AbortController();
     this.connectAbort = abort;
-    const flight = this.doConnect(abort).finally(() => {
+    const flight = (async () => {
+      // Serialize behind an in-progress disconnect/shutdown: the dial starts
+      // only after the close has fully converged, so a finishing close can
+      // never stomp the state a fresh connect just wrote.
+      while (this.closeFlight) {
+        await this.closeFlight.catch(() => {});
+      }
+      if (abort.signal.aborted) throw new TransportError('connect aborted');
+      if (this.stateNow() === TransportState.Stopped) {
+        throw new TransportError('client is shut down');
+      }
+      await this.doConnect(abort);
+    })().finally(() => {
       if (this.connectFlight === flight) {
         this.connectFlight = null;
         this.connectAbort = null;
@@ -285,7 +303,9 @@ export class TransportClient {
           this.retryOpts.initialDelayMs *
             Math.pow(this.retryOpts.multiplier, attempt - 1),
         );
-        await sleep(delay);
+        // Abort resolves the sleep early; the check below turns it into
+        // rejection — disconnect()/shutdown() never wait a backoff out.
+        await sleep(delay, abort.signal);
       }
       if (abort.signal.aborted) {
         if (this._state === TransportState.Connecting) {
@@ -336,6 +356,10 @@ export class TransportClient {
         }
       },
     );
+    // Register as current BEFORE subscribing: a session that synchronously
+    // replays a close during subscribe() must be recognized as current so
+    // the close handler retires it — not mistaken for a stale link's echo.
+    this.session = session;
     // The observer is bound to THIS session: an old link's late events act
     // on the old (retired) session and stop there — by construction, not by
     // a generation check someone has to remember.
@@ -346,7 +370,16 @@ export class TransportClient {
         if (session === this.session && !session.closed) this.dispatchError(e);
       },
     });
-    this.session = session;
+    if (session.closed || !link.isOpen()) {
+      // The link died during installation (a synchronous close replay was
+      // already handled above); this connect attempt FAILED — never report
+      // Open over a dead session.
+      if (this.session === session) this.session = null;
+      session.retire(
+        new TransportError('connection closed during establishment'),
+      );
+      throw new TransportError('connection closed during establishment');
+    }
   }
 
   /**
@@ -358,27 +391,25 @@ export class TransportClient {
     if (this.connectFlight) {
       await this.connectFlight.catch(() => {});
     }
+    if (this.closeFlight) {
+      // A close is already in progress: JOIN it instead of racing it.
+      await this.closeFlight;
+      return;
+    }
     const session = this.session;
-    if (session) {
-      this._state = TransportState.Closing;
-      // Retire first: even a link whose close() never reports cannot leave
-      // the session's async work alive.
-      this.retireSession(new TransportError('disconnected'));
-      await session.link.close({ reason: 'disconnected' });
+    if (!session) {
       if (this.stateNow() !== TransportState.Stopped) {
         this._state = TransportState.Idle;
       }
-      // The close EVENT fires for every session end, intentional included —
-      // consumers (reconnect state machines, UI) key their lifecycle on it
-      // and distinguish wanted from unwanted closes with their own flag.
-      // Retiring unsubscribed the link observer, so this is the one
-      // deterministic notification.
-      this.emitClose({ reason: 'disconnected', intentional: true });
       return;
     }
-    if (this._state !== TransportState.Stopped) {
-      this._state = TransportState.Idle;
+    if (this.stateNow() !== TransportState.Stopped) {
+      this._state = TransportState.Closing;
     }
+    // Retire first: even a link whose close() never reports cannot leave
+    // the session's async work alive.
+    this.retireSession(new TransportError('disconnected'));
+    await this.beginClose(session, 'disconnected');
   }
 
   /** Terminal shutdown: disconnects and refuses every future `connect()`. */
@@ -388,13 +419,46 @@ export class TransportClient {
     if (this.connectFlight) {
       await this.connectFlight.catch(() => {});
     }
+    if (this.closeFlight) {
+      // Take over the in-flight close: shutdown resolves only once the
+      // physical session is actually down, not merely dereferenced.
+      await this.closeFlight;
+    }
     const session = this.session;
     if (session) {
       this.retireSession(new TransportError('shut down'));
-      await session.link.close({ reason: 'shut down' });
-      this.emitClose({ reason: 'shut down', intentional: true });
+      await this.beginClose(session, 'shut down');
     }
     this._state = TransportState.Stopped;
+  }
+
+  /**
+   * The ONE close path for intentional session ends. State convergence and
+   * the exactly-once close notification live in `finally`: a misbehaving
+   * `TransportSession.close()` (rejects, throws) cannot strand the client in
+   * Closing or swallow the event. The close EVENT fires for every session
+   * end, intentional included — consumers (reconnect machines, UI) key
+   * their lifecycle on it and distinguish wanted from unwanted closes with
+   * their own flag. Retiring unsubscribed the link observer, so this is the
+   * one deterministic notification.
+   */
+  private beginClose(session: ClientSession, reason: string): Promise<void> {
+    const flight = (async () => {
+      try {
+        await session.link.close({ reason });
+      } catch (e) {
+        this.dispatchError(e);
+      } finally {
+        if (this.stateNow() === TransportState.Closing) {
+          this._state = TransportState.Idle;
+        }
+        this.emitClose({ reason, intentional: true });
+      }
+    })().finally(() => {
+      if (this.closeFlight === flight) this.closeFlight = null;
+    });
+    this.closeFlight = flight;
+    return flight;
   }
 
   /**
@@ -547,10 +611,12 @@ export class TransportClient {
     session.retire(new TransportError('transport closed'));
     if (!wasCurrent) return; // an old link's close is its own business
     this.session = null;
-    if (
-      this._state !== TransportState.Stopped &&
-      this._state !== TransportState.Connecting
-    ) {
+    if (this._state === TransportState.Connecting) {
+      // Closed during installation: the connect() promise carries the
+      // failure; a session that never became Open emits no close event.
+      return;
+    }
+    if (this._state !== TransportState.Stopped) {
       this._state = TransportState.Idle;
     }
     this.emitClose(ev);
@@ -814,12 +880,13 @@ function buildPlain(
 }
 
 function resolveConnector(options: TransportClientOptions): TransportConnector {
+  if (options.connector) return options.connector;
   if (options.transport && typeof options.transport === 'object') {
     return options.transport;
   }
   if (!options.url) {
     throw new TransportError(
-      'TransportClient requires either `url` (for the default WebSocket connector) or a `transport` connector',
+      'TransportClient requires either `url` (for the default WebSocket connector) or a `connector`',
     );
   }
   return new WebSocketConnector({
@@ -837,6 +904,17 @@ function removeFrom<T>(arr: T[], item: T): void {
   if (i >= 0) arr.splice(i, 1);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Resolves after `ms` OR as soon as `signal` aborts — a cancelled wait must
+ *  not hold `disconnect()`/`shutdown()` hostage for the backoff duration. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish);
+  });
 }

@@ -62,28 +62,43 @@ export class WebTransportConnector implements TransportConnector {
     const factory =
       this.opts.webTransportFactory ?? defaultWebTransportFactory;
     const wt = factory(this.opts.url);
-    const abortDial = () => {
+    const closeQuietly = () => {
       try {
         wt.close();
       } catch {
         /* already dead */
       }
     };
-    signal.addEventListener('abort', abortDial);
+    // Abort must win even if the platform never settles `ready` (or
+    // `createBidirectionalStream`): both dial stages RACE the signal instead
+    // of trusting `close()` to make them reject.
+    let onAbort: () => void = () => {};
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => {
+        closeQuietly();
+        reject(new TransportError('connect aborted'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    // The race's loser must not surface as an unhandled rejection.
+    aborted.catch(() => {});
     try {
-      await wt.ready;
-      const stream = await wt.createBidirectionalStream();
+      await Promise.race([wt.ready, aborted]);
+      const stream = await Promise.race([
+        wt.createBidirectionalStream(),
+        aborted,
+      ]);
       if (signal.aborted) {
         // Cancel AND release the connection the dial won.
-        abortDial();
+        closeQuietly();
         throw new TransportError('connect aborted');
       }
       return new WebTransportSession(wt, stream, this.limits);
     } catch (e) {
-      abortDial();
+      closeQuietly();
       throw e instanceof Error ? e : new TransportError(String(e));
     } finally {
-      signal.removeEventListener('abort', abortDial);
+      signal.removeEventListener('abort', onAbort);
     }
   }
 }

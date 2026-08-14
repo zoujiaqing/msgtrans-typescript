@@ -209,7 +209,7 @@ describe('WebTransportConnector — under a full TransportClient', () => {
   it('request/response works end to end over the byte stream', async () => {
     const wt = new FakeWt();
     const client = new TransportClient({
-      transport: new WebTransportConnector({
+      connector: new WebTransportConnector({
         url: 'https://test.invalid/wt',
         webTransportFactory: () => wt,
       }),

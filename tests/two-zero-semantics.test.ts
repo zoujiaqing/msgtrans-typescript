@@ -121,7 +121,7 @@ describe('inbound normalization', () => {
     // The defect this closes: compressed packets were handed to the app
     // as-is — compressed bytes under a still-set compression flag, silently.
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const received: ClientMessage[] = [];
     c.on('message', (m) => received.push(m));
@@ -134,7 +134,7 @@ describe('inbound normalization', () => {
 
   it('an algorithm with no codec (Zstd) is FATAL: error + connection closed, nothing delivered', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const received: ClientMessage[] = [];
     const errors: unknown[] = [];
@@ -159,7 +159,7 @@ describe('inbound normalization', () => {
 
   it('a corrupt compressed body is FATAL: error + connection closed', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const errors: unknown[] = [];
     c.on('error', (e) => errors.push(e));
@@ -179,7 +179,7 @@ describe('inbound normalization', () => {
     // Async decompression without serialization would let the later plain
     // packet overtake the earlier compressed one.
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const order: string[] = [];
     c.on('message', (m) => order.push(decode(m.payload)));
@@ -199,7 +199,7 @@ describe('inbound normalization', () => {
 
   it('a compressed RESPONSE resolves the pending request with plaintext', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const promise = c.request(text('ask'));
     await flush();
@@ -226,7 +226,7 @@ describe('inbound normalization', () => {
 describe('outbound compression', () => {
   it('send() with Zlib puts a genuinely compressed body on the wire', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const body = text('repetitive '.repeat(200));
 
@@ -248,7 +248,7 @@ describe('outbound compression', () => {
     // async, so without the outbound chain the plain packet would hit the
     // wire first.
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
 
     void c.send(text('a '.repeat(500)), { compression: CompressionType.Zlib });
@@ -261,7 +261,7 @@ describe('outbound compression', () => {
 
   it('respond() with Zlib compresses the response body', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     let captured: ClientRequest | null = null;
     c.on('request', (r) => {
@@ -298,7 +298,7 @@ describe('request timeout starts at enqueue', () => {
     // 100 ms measured from enqueue completion.
     const t = new FakeTransport();
     t.sendDelayMs = 60;
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
 
     const promise = c.request(text('ask'), { timeoutMs: 100 });
@@ -318,7 +318,7 @@ describe('request timeout starts at enqueue', () => {
   it('an enqueue failure rejects immediately with the send error, not a timeout', async () => {
     const t = new FakeTransport();
     t.sendShouldFail = new Error('enqueue exploded');
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     await expect(c.request(text('ask'), { timeoutMs: 50 })).rejects.toThrow(
       'enqueue exploded',

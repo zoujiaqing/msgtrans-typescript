@@ -15,7 +15,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 describe('HeartbeatMonitor', () => {
   function rig(probe: () => Promise<unknown>, extra: { onDead?: (e: unknown) => void } = {}) {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     const hb = new HeartbeatMonitor(c, {
       probe,
       intervalMs: 120,
@@ -92,7 +92,7 @@ describe('HeartbeatMonitor', () => {
 describe('ReconnectManager', () => {
   it('reconnects after close with backoff and reports phases', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const phases: Array<[ReconnectPhase, number]> = [];
     const rm = new ReconnectManager(c, {
@@ -117,7 +117,7 @@ describe('ReconnectManager', () => {
 
   it('stop() before an intentional close prevents reconnection', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const rm = new ReconnectManager(c, { initialDelayMs: 10 });
     rm.start();
@@ -135,7 +135,7 @@ describe('ReconnectManager', () => {
     // already running when stop() arrives, so the in-cycle active check is
     // the only thing standing between stop() and a zombie reconnect.
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const rm = new ReconnectManager(c, { initialDelayMs: 60 });
     rm.start();
@@ -150,7 +150,7 @@ describe('ReconnectManager', () => {
 
   it('gives up after maxAttempts and deactivates', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const phases: ReconnectPhase[] = [];
     const rm = new ReconnectManager(c, {
@@ -170,7 +170,7 @@ describe('ReconnectManager', () => {
 
   it('a close arriving mid-cycle is absorbed (one cycle at a time)', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const phases: ReconnectPhase[] = [];
     const rm = new ReconnectManager(c, {

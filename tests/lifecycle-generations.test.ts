@@ -20,7 +20,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 describe('P0-1: connect() on a live connection must not restart the id space', () => {
   it('a redundant connect() while a request is pending does not reuse its id', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
 
     const first = c.request(text('one'), { timeoutMs: 0 });
@@ -59,7 +59,7 @@ describe('P0-2: inbound normalization is generation-bound and poisonable', () =>
 
   it("a previous generation's in-flight decompression cannot deliver into the new one", async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const received: string[] = [];
     c.on('message', (m) => received.push(decode(m.payload)));
@@ -83,7 +83,7 @@ describe('P0-2: inbound normalization is generation-bound and poisonable', () =>
 
   it('after a fatal normalization failure, already-queued packets are NOT delivered', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const received: string[] = [];
     const errors: unknown[] = [];
@@ -206,7 +206,7 @@ describe('P1: stale async results cannot fire', () => {
   it('a probe still in flight when HeartbeatMonitor.stop() runs cannot declare death', async () => {
     const { HeartbeatMonitor } = await import('../src/index.js');
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     let failProbe!: (e: Error) => void;
     const dead: unknown[] = [];
@@ -230,7 +230,7 @@ describe('P1: stale async results cannot fire', () => {
   it('a close landing while a reconnect cycle is finishing is not swallowed', async () => {
     const { ReconnectManager } = await import('../src/index.js');
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     // DETERMINISTIC race: drop the connection again from INSIDE the
     // 'connected' callback — at that instant the cycle is still running
@@ -266,14 +266,14 @@ describe('P1: sealed handles and validated config', () => {
     expect(
       () =>
         new TransportClient({
-          transport: new FakeTransport(),
+          connector: new FakeTransport(),
           limits: { maxPayloadLen: Number.NaN },
         }),
     ).toThrow();
     expect(
       () =>
         new TransportClient({
-          transport: new FakeTransport(),
+          connector: new FakeTransport(),
           limits: { maxPayloadLen: -5 },
         }),
     ).toThrow();
@@ -281,7 +281,7 @@ describe('P1: sealed handles and validated config', () => {
 
   it('invalid reconnect/heartbeat numbers are rejected', async () => {
     const { ReconnectManager, HeartbeatMonitor } = await import('../src/index.js');
-    const c = new TransportClient({ transport: new FakeTransport() });
+    const c = new TransportClient({ connector: new FakeTransport() });
     expect(() => new ReconnectManager(c, { initialDelayMs: -1 })).toThrow();
     expect(() => new ReconnectManager(c, { multiplier: 0.5 })).toThrow();
     expect(

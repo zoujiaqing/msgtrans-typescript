@@ -59,7 +59,7 @@ describe('P0-1: async sends cannot cross a reconnect', () => {
   it('a compressed send started on the old connection is refused after reconnect', async () => {
     const { codec, releaseCompress } = gatedCodec();
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t, codecs: [codec] });
+    const c = new TransportClient({ connector: t, codecs: [codec] });
     await c.connect();
 
     // The send enters its (gated) compression on generation 1…
@@ -100,7 +100,7 @@ describe('P0-2: concurrent connect() is single-flight', () => {
 
   it('two racing connect() calls share one attempt and one generation', async () => {
     const t = new SlowConnectTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
 
     const first = c.connect();
     const second = c.connect();
@@ -137,7 +137,7 @@ describe('P0-3: ownership does not depend on the adapter firing close', () => {
   it("an old session's in-flight decompression is void even without a close event", async () => {
     const { codec, releaseDecompress } = gatedCodec();
     const t = new SilentCloseTransport();
-    const c = new TransportClient({ transport: t, codecs: [codec] });
+    const c = new TransportClient({ connector: t, codecs: [codec] });
     await c.connect();
     const received: string[] = [];
     c.on('message', (m) => received.push(new TextDecoder().decode(m.payload)));
@@ -224,7 +224,7 @@ describe('P1: poisoning covers the packet already in flight', () => {
     const { codec, releaseDecompress } = gatedCodec();
     const t = new FakeTransport();
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       codecs: [codec],
       maxInboundQueueFrames: 2,
     });
@@ -262,7 +262,7 @@ describe('P1: poisoning covers the packet already in flight', () => {
 describe('P1: helper epochs cover success paths and restarts', () => {
   it('after stop();start(), a hung old probe does not block the new cycle', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     let probes = 0;
     let firstProbe = true;
@@ -291,7 +291,7 @@ describe('P1: helper epochs cover success paths and restarts', () => {
 
   it('stop();start() during a backoff sleep does not let the OLD cycle zombie-connect', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const rm = new ReconnectManager(c, { initialDelayMs: 60, jitterRatio: 0 });
     rm.start();
@@ -312,7 +312,7 @@ describe('P1: helper epochs cover success paths and restarts', () => {
 describe('P1: strict config validation is complete', () => {
   it('connectRetry rejects negative/fractional/non-finite values', () => {
     const mk = (connectRetry: Record<string, number>) => () =>
-      new TransportClient({ transport: new FakeTransport(), connectRetry });
+      new TransportClient({ connector: new FakeTransport(), connectRetry });
     expect(mk({ maxRetries: -1 })).toThrow();
     expect(mk({ maxRetries: 1.5 })).toThrow();
     expect(mk({ initialDelayMs: Number.NaN })).toThrow();
@@ -320,7 +320,7 @@ describe('P1: strict config validation is complete', () => {
   });
 
   it('reconnect rejects Infinity multiplier and fractional maxAttempts; Infinity maxAttempts is legal', () => {
-    const c = new TransportClient({ transport: new FakeTransport() });
+    const c = new TransportClient({ connector: new FakeTransport() });
     expect(() => new ReconnectManager(c, { multiplier: Infinity })).toThrow();
     expect(() => new ReconnectManager(c, { maxAttempts: 1.5 })).toThrow();
     expect(
@@ -332,7 +332,7 @@ describe('P1: strict config validation is complete', () => {
     expect(
       () =>
         new TransportClient({
-          transport: new FakeTransport(),
+          connector: new FakeTransport(),
           defaultTimeoutMs: Number.NaN,
         }),
     ).toThrow();
@@ -340,7 +340,7 @@ describe('P1: strict config validation is complete', () => {
       () =>
         new WebSocketConnector({ url: 'ws://x', maxBufferedBytes: -1 }),
     ).toThrow();
-    const c = new TransportClient({ transport: new FakeTransport() });
+    const c = new TransportClient({ connector: new FakeTransport() });
     void expect(c.request(text('x'), { timeoutMs: -5 })).rejects.toThrow();
   });
 });
@@ -353,7 +353,7 @@ describe('P1: handles are interfaces; requests have ONE consumer', () => {
 
   it('handles carry a kind discriminant', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const kinds: string[] = [];
     c.on('message', (m) => kinds.push(m.kind));
@@ -365,7 +365,7 @@ describe('P1: handles are interfaces; requests have ONE consumer', () => {
   });
 
   it('a second request consumer is refused (single response obligation)', () => {
-    const c = new TransportClient({ transport: new FakeTransport() });
+    const c = new TransportClient({ connector: new FakeTransport() });
     const off = c.on('request', () => {});
     expect(() => c.on('request', () => {})).toThrow();
     off();
@@ -378,7 +378,7 @@ describe('P2: queue caps are byte-aware on both directions', () => {
     const { codec } = gatedCodec(); // never released: compression hangs
     const t = new FakeTransport();
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       codecs: [codec],
       maxOutboundQueue: 2,
     });
@@ -398,7 +398,7 @@ describe('P2: queue caps are byte-aware on both directions', () => {
     const { codec } = gatedCodec();
     const t = new FakeTransport();
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       codecs: [codec],
       maxOutboundQueueBytes: 1024,
     });

@@ -18,7 +18,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 describe('P0-1: an old connection cannot answer the new one', () => {
   it("a late same-id Response from the OLD session cannot complete the NEW session's request", async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     const oldSession = t.sessions[0]!;
 
@@ -64,7 +64,7 @@ describe('P0-2: an async enqueue cannot cross a reconnect', () => {
   it('a session whose enqueue awaits internally still writes to ITS OWN (closed) link', async () => {
     const t = new FakeTransport();
     t.sendDelayMs = 60; // the custom-transport async-write scenario
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
 
     // The send enters the old session's slow enqueue…
@@ -89,7 +89,7 @@ describe('P0-2: an async enqueue cannot cross a reconnect', () => {
 describe('P1-4: heartbeat does not occupy the request consumer', () => {
   it('an app request handler and a heartbeat coexist, in either order', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
 
     // App registers the single request consumer FIRST…
@@ -116,7 +116,7 @@ describe('P1-4: heartbeat does not occupy the request consumer', () => {
 
   it('activity via the tap actually suppresses probing', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     let probes = 0;
     const hb = new HeartbeatMonitor(c, {
@@ -138,7 +138,7 @@ describe('P1-4: heartbeat does not occupy the request consumer', () => {
 describe('shutdown() is terminal; disconnect() is not', () => {
   it('disconnect allows reconnection; shutdown refuses it', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     await c.disconnect();
     await c.connect(); // fine

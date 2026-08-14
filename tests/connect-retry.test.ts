@@ -22,7 +22,7 @@ describe('TransportClient — connectRetry', () => {
   it('default = single attempt, no retry on failure', async () => {
     const t = new FakeTransport();
     t.connectShouldFail = new TransportError('boom');
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
 
     await expect(c.connect()).rejects.toBeInstanceOf(TransportError);
     expect(t.connectCalls).toHaveLength(1);
@@ -32,7 +32,7 @@ describe('TransportClient — connectRetry', () => {
     const t = new FakeTransport();
     t.connectShouldFail = new TransportError('always fails');
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       connectRetry: {
         maxRetries: 3,
         initialDelayMs: 10,
@@ -68,7 +68,7 @@ describe('TransportClient — connectRetry', () => {
       return origConnect(opts);
     };
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       connectRetry: { maxRetries: 3, initialDelayMs: 10, maxDelayMs: 100 },
     });
 
@@ -82,7 +82,7 @@ describe('TransportClient — connectRetry', () => {
     const t = new FakeTransport();
     t.connectShouldFail = new TransportError('always fails');
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       connectRetry: {
         maxRetries: 4,
         initialDelayMs: 100,
@@ -118,7 +118,7 @@ describe('TransportClient — connectRetry', () => {
     const t = new FakeTransport();
     t.connectShouldFail = new TransportError('boom');
     const c = new TransportClient({
-      transport: t,
+      connector: t,
       connectRetry: { maxRetries: 0 },
     });
 

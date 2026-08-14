@@ -195,7 +195,7 @@ describe('send failure on a dead socket', () => {
 describe('orphan Response handling', () => {
   it('drops a Response with no pending request and reports via the error channel', async () => {
     const fake = new FakeTransport();
-    const client = new TransportClient({ transport: fake });
+    const client = new TransportClient({ connector: fake });
     await client.connect();
 
     const messages: unknown[] = [];
@@ -221,7 +221,7 @@ describe('orphan Response handling', () => {
 
   it('OneWay packets still flow to message listeners untouched', async () => {
     const fake = new FakeTransport();
-    const client = new TransportClient({ transport: fake });
+    const client = new TransportClient({ connector: fake });
     await client.connect();
 
     const messages: unknown[] = [];

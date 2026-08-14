@@ -416,6 +416,8 @@ export interface TransportClientOptions {
     url?: string;
     /** A custom connection factory; defaults to `WebSocketConnector` built
      *  from `url` + the WebSocket options below. */
+    connector?: TransportConnector;
+    /** @deprecated Use `connector`. (`'websocket'` is the default behavior.) */
     transport?: 'websocket' | TransportConnector;
     protocols?: string | string[];
     webSocketFactory?: WebSocketFactory;
@@ -495,6 +497,10 @@ export declare class TransportClient {
     /** Single-flight connect + its cancellation handle. */
     private connectFlight;
     private connectAbort;
+    /** Single-flight close (disconnect/shutdown). While it is pending, no dial
+     *  may start and no other lifecycle op may touch the state — the three
+     *  operations are SERIALIZED, never interleaved. */
+    private closeFlight;
     constructor(options: TransportClientOptions);
     /** Public lifecycle state: Idle / Connecting / Open / Closing / Stopped. */
     get state(): TransportState;
@@ -518,6 +524,17 @@ export declare class TransportClient {
     disconnect(): Promise<void>;
     /** Terminal shutdown: disconnects and refuses every future `connect()`. */
     shutdown(): Promise<void>;
+    /**
+     * The ONE close path for intentional session ends. State convergence and
+     * the exactly-once close notification live in `finally`: a misbehaving
+     * `TransportSession.close()` (rejects, throws) cannot strand the client in
+     * Closing or swallow the event. The close EVENT fires for every session
+     * end, intentional included — consumers (reconnect machines, UI) key
+     * their lifecycle on it and distinguish wanted from unwanted closes with
+     * their own flag. Retiring unsubscribed the link observer, so this is the
+     * one deterministic notification.
+     */
+    private beginClose;
     /**
      * One-way send, enqueue-confirmed, SESSION-BOUND: the send belongs to the
      * connection that was current when it was CALLED, and its enqueue lands on

@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 0.6.1-beta.0 — 2026-08-14
+
+**Serialized lifecycle supervisor** (ninth review). `connect()`,
+`disconnect()` and `shutdown()` are serialized — never interleaved — and
+every post-await state write is owned:
+
+- A dial queues BEHIND an in-progress close (`closeFlight`), so a finishing
+  `disconnect()` can no longer write `Idle` over a session a concurrent
+  `connect()` just installed.
+- `shutdown()` takes over an in-flight close and resolves only once the
+  physical session is actually down (previously it returned early because
+  the session reference was already null).
+- Session install is atomic: the session becomes current BEFORE
+  `subscribe()`, and a close replayed synchronously during subscribe fails
+  the connect (`connection closed during establishment`) instead of
+  installing a dead session and reporting Open. A session that never became
+  Open emits no close event — the `connect()` rejection is the report.
+- Close-state convergence and the exactly-once close notification moved
+  into `finally`: a `TransportSession.close()` that rejects cannot strand
+  the client in `Closing` (the error surfaces via `on('error')`).
+- The connect-retry backoff sleep is abort-interruptible:
+  `disconnect()`/`shutdown()` no longer wait a backoff out.
+- WebTransport dial races the AbortSignal against `ready` AND
+  `createBidirectionalStream` — abort wins even when the platform never
+  settles either.
+
+### Changed
+
+- The connector option is now officially `connector?: TransportConnector`;
+  `transport?` remains as a deprecated alias. README migrated off the
+  pre-0.6 `Transport`/`client.close()`/`WebTransportTransport` names.
+
 ## 0.6.0-beta.0 — 2026-08-14
 
 **The Connector/Session SPI** (eighth review). The shared reconnectable

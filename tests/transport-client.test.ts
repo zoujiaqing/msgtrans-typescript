@@ -12,10 +12,10 @@ import {
 } from '../src/index.js';
 import { FakeTransport, flush } from './fake-transport.js';
 
-async function newClient(transport: FakeTransport): Promise<TransportClient> {
+async function newClient(connector: FakeTransport): Promise<TransportClient> {
   // Connector model: no session exists until connect() — a client that never
   // connected cannot send or receive, so these behavior tests connect first.
-  const c = new TransportClient({ transport });
+  const c = new TransportClient({ connector });
   await c.connect();
   return c;
 }
@@ -41,7 +41,7 @@ function makeRequestInbound(messageId: number, bizType = 7): Packet {
 describe('TransportClient — lifecycle', () => {
   it('connect/close pass through to transport', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     expect(t.connectCalls).toHaveLength(1);
     await c.disconnect();
@@ -54,7 +54,7 @@ describe('TransportClient — lifecycle', () => {
 
   it('uses an injected Transport instance verbatim', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     await c.connect();
     expect(t.connectCalls).toHaveLength(1);
   });
@@ -102,7 +102,7 @@ describe('TransportClient — send / request convenience methods', () => {
     expect(new TextDecoder().decode(respBytes)).toBe('pong');
   });
 
-  it('ids belong to the transport: no public path accepts a caller-numbered packet', () => {
+  it('ids belong to the connector: no public path accepts a caller-numbered packet', () => {
     // `sendPacket()` / `requestPacket()` / `initialMessageId` are gone: a
     // caller-numbered Request could complete a DIFFERENT pending waiter that
     // happened to draw the same id (the ABA the Rust 2.0 registry closed).
@@ -319,7 +319,7 @@ describe('TransportClient — Rust-compat surface', () => {
 
   it('isConnected() reflects the session lifecycle', async () => {
     const t = new FakeTransport();
-    const c = new TransportClient({ transport: t });
+    const c = new TransportClient({ connector: t });
     expect(c.isConnected()).toBe(false); // no session before connect
 
     await c.connect();

@@ -4,7 +4,7 @@ TypeScript client runtime for the [msgtrans](https://github.com/zoujiaqing/msgtr
 
 `@msgtrans/client` is the language mapping of the `msgtrans` Rust client surface — same Packet semantics, same Request/Response correlation rules, same wire bytes. The wire format is defined by [`WIRE_FORMAT.md`](https://github.com/zoujiaqing/msgtrans/blob/main/docs/WIRE_FORMAT.md) and conformance is verified by a shared cross-language fixture suite.
 
-> **Status: 0.6.0-beta.0** — Connector/Session SPI: per-connection ownership at the public boundary: strict decode, transport-owned message ids, connection generations, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
+> **Status: 0.6.1-beta.0** — Connector/Session SPI with a serialized lifecycle supervisor: per-connection ownership at the public boundary, strict decode, transport-owned message ids, serialized inbound normalization, and working zlib compression (native streams), all fixture- and E2E-verified against the Rust 2.0 server.
 >
 > **Compatibility matrix**
 >
@@ -108,19 +108,20 @@ The same hook lets you swap in a custom WebSocket (TLS-pinned, telemetry-wrapped
 
 ```ts
 new TransportClient({
-  url: string;                       // required when using the default WebSocket transport
-  transport?: 'websocket' | Transport;
+  url: string;                       // required when using the default WebSocket connector
+  connector?: TransportConnector;    // custom connection factory
   protocols?: string | string[];
   webSocketFactory?: WebSocketFactory;
   onTextFrame?: 'error' | 'ignore';  // default: 'error'
   defaultTimeoutMs?: number;         // default: 10_000
 });
 
-// Lifecycle
-client.connect(): Promise<void>;
-client.close(): Promise<void>;
-client.disconnect(): Promise<void>;  // alias for close()
+// Lifecycle (state: idle / connecting / open / closing / stopped)
+client.connect(): Promise<void>;     // single-flight, abortable
+client.disconnect(): Promise<void>;  // ends the connection; reconnect allowed
+client.shutdown(): Promise<void>;    // TERMINAL: later connect() is refused
 client.isConnected(): boolean;
+client.state: TransportState;
 
 // Sending
 client.send(payload: Uint8Array, options?: SendOptions): Promise<void>;
@@ -129,7 +130,7 @@ client.request(payload: Uint8Array, options?: RequestOptions): Promise<Uint8Arra
 // There is deliberately NO lower-level packet send: message ids belong to
 // the transport (a caller-numbered Request could complete a different
 // pending waiter that drew the same id — the ABA the Rust 2.0 registry
-// closed). `Packet` stays exported for codecs/fixtures/custom Transports.
+// closed). `Packet` stays exported for codecs/fixtures/custom connectors.
 
 // Events (each returns an unsubscribe function)
 client.on('message',         (msg: ClientMessage) => void): () => void;
@@ -165,7 +166,7 @@ interface RequestOptions extends SendOptions {
 |---|---|
 | `TransportClientBuilder::new().with_protocol(WebSocketClientConfig::new(url)?).build().await?` | `new TransportClient({ url })` |
 | `client.connect().await?` | `await client.connect()` |
-| `client.disconnect().await?` | `await client.disconnect()` (or `client.close()`) |
+| `client.disconnect().await?` | `await client.disconnect()` (terminal teardown: `client.shutdown()`) |
 | `client.is_connected().await` | `client.isConnected()` (sync) |
 | `client.send_with_options(bytes, SendOptions::new().biz_type(5))` | `client.send(bytes, { bizType: 5 })` |
 | `client.request_with_options(bytes, RequestOptions::new().timeout(d))` | `client.request(bytes, { timeoutMs: 10_000 })` |
@@ -202,7 +203,7 @@ Cross-language conformance is enforced: every release runs the same fixture set 
 | TCP | — | — | not in scope (browser cannot do raw TCP) |
 | QUIC (raw) | — | — | not in scope (no browser API) |
 
-`WebTransportTransport` exists today behind the `experimental` subpath (Rust-QUIC-mirror framing); it graduates to the root API once a real server interop E2E exists.
+`WebTransportConnector` exists today behind the `experimental` subpath (Rust-QUIC-mirror framing); it graduates to the root API once a real server interop E2E exists.
 
 ## Roadmap
 
