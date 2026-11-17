@@ -6,6 +6,10 @@ import {
   TransportClient,
   type WebSocketLike,
 } from '../../src/index.js';
+import {
+  DEFAULT_MAX_EXT_HEADER_LEN,
+  DEFAULT_MAX_PAYLOAD_LEN,
+} from '../../src/constants.js';
 import { spawnDedicatedEchoServer, type SpawnedServer } from './setup.js';
 import { defineEchoSuite } from './echo-suite.js';
 
@@ -24,6 +28,44 @@ afterAll(async () => {
 
 defineEchoSuite('E2E (dedicated) — Rust e2e_echo_server ↔ TS TransportClient', {
   url: () => `ws://127.0.0.1:${PORT}`,
+});
+
+it('negotiates msgtrans.v1 with the Rust WebSocket endpoint', async () => {
+  let socket: WS | undefined;
+  const client = new TransportClient({
+    url: server.url,
+    protocols: ['msgtrans.v1'],
+    webSocketFactory: (url, protocols) => {
+      socket = new WS(url, protocols);
+      return socket as unknown as WebSocketLike;
+    },
+  });
+  try {
+    await client.connect();
+    expect(socket?.protocol).toBe('msgtrans.v1');
+    const body = new Uint8Array([0, 1, 255]);
+    expect(await client.request(body)).toEqual(body);
+  } finally {
+    await client.shutdown();
+  }
+});
+
+it('round-trips a maximum-size default frame with both headers', async () => {
+  const client = new TransportClient({
+    url: server.url,
+    webSocketFactory: (url, protocols) =>
+      new WS(url, protocols) as unknown as WebSocketLike,
+  });
+  try {
+    await client.connect();
+    const body = Buffer.alloc(DEFAULT_MAX_PAYLOAD_LEN, 0xa5);
+    const reply = await client.request(body, {
+      extHeader: new Uint8Array(DEFAULT_MAX_EXT_HEADER_LEN),
+    });
+    expect(Buffer.from(reply).equals(body)).toBe(true);
+  } finally {
+    await client.shutdown();
+  }
 });
 
 describe('E2E zlib interop — real Rust 2.0 compression on both sides', () => {

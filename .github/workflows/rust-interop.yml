@@ -1,0 +1,41 @@
+name: Rust candidate interop
+
+on:
+  workflow_dispatch:
+    inputs:
+      rust_commit:
+        description: "Full commit SHA of the msgtrans Rust candidate"
+        required: true
+        type: string
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a pinned Rust commit
+        env:
+          SHA: ${{ inputs.rust_commit }}
+        run: '[[ "$SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: zoujiaqing/msgtrans
+          ref: ${{ inputs.rust_commit }}
+          path: rust-peer
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - run: npm ci
+      - working-directory: rust-peer
+        run: cargo build --locked -p msgtrans --features flate2 --example e2e_echo_server --example echo_server
+      - env:
+          MSGTRANS_RUST_DIR: ${{ github.workspace }}/rust-peer
+          MSGTRANS_RUST_EXAMPLES_DIR: ${{ github.workspace }}/rust-peer/target/debug/examples
+        run: |
+          npm run sync-fixtures -- --check
+          npm run test:e2e:all

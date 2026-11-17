@@ -124,7 +124,7 @@ describe('backpressure guard', () => {
     const t = await openTransport(m, 0);
     await t.send(packet()); // disabled → goes through
     expect(m.sent).toHaveLength(1);
-    expect(DEFAULT_MAX_BUFFERED_BYTES).toBe(16 * 1024 * 1024);
+    expect(DEFAULT_MAX_BUFFERED_BYTES).toBe(16 * 1024 * 1024 + 0xffff + 16);
   });
 });
 

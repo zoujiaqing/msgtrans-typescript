@@ -6,7 +6,10 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TS_PKG_ROOT = resolve(__dirname, '..', '..');
-const MSGTRANS_DIR = resolve(TS_PKG_ROOT, '..', 'msgtrans');
+const MSGTRANS_DIR = resolve(
+  process.env.MSGTRANS_RUST_DIR ?? resolve(TS_PKG_ROOT, '..', 'msgtrans'),
+);
+const PREBUILT_EXAMPLES_DIR = process.env.MSGTRANS_RUST_EXAMPLES_DIR;
 const READY_PREFIX = 'MSGTRANS_E2E_READY ';
 
 export interface SpawnedServer {
@@ -28,34 +31,26 @@ export interface SpawnServerOptions {
  * Spawn a Rust example as a child process, wait for its ready line,
  * verify the WS port is connectable, and return a handle.
  *
- * Prefers a prebuilt binary at `target/debug/examples/<example>` if it exists
- * (fast path); otherwise falls back to `cargo run --example <example>`.
+ * Builds from the selected Rust checkout/archive with compression enabled,
+ * unless an explicit directory of prebuilt candidate examples is supplied.
  */
 export async function spawnServer(
   options: SpawnServerOptions,
 ): Promise<SpawnedServer> {
-  if (!existsSync(MSGTRANS_DIR)) {
-    throw new Error(
-      `msgtrans crate not found at ${MSGTRANS_DIR}. ` +
-        `E2E tests require the Rust workspace alongside this package.`,
-    );
+  const binary = PREBUILT_EXAMPLES_DIR
+    ? resolve(PREBUILT_EXAMPLES_DIR, options.example)
+    : undefined;
+  if (!existsSync(binary ?? join(MSGTRANS_DIR, 'Cargo.toml'))) {
+    throw new Error(`Rust test peer not found: ${binary ?? MSGTRANS_DIR}`);
   }
 
-  const prebuilt = join(
-    MSGTRANS_DIR,
-    'target',
-    'debug',
-    'examples',
-    options.example,
-  );
-  const useBinary = existsSync(prebuilt);
-  const cmd = useBinary ? prebuilt : 'cargo';
-  const args = useBinary
+  const cmd = binary ?? 'cargo';
+  const args = binary
     ? []
-    : ['run', '--quiet', '--example', options.example, '--features', 'flate2'];
+    : ['run', '--locked', '--quiet', '--example', options.example, '--features', 'flate2'];
 
   const child = spawn(cmd, args, {
-    cwd: MSGTRANS_DIR,
+    cwd: binary ? dirname(binary) : MSGTRANS_DIR,
     env: { ...process.env, ...options.env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -64,8 +59,14 @@ export async function spawnServer(
     process.stderr.write(`[${options.example} stderr] ${chunk.toString('utf8')}`);
   });
 
-  const url = await waitForReadyLine(child, options.example);
-  await waitForTcpConnectable(options.wsPort);
+  let url: string;
+  try {
+    url = await waitForReadyLine(child, options.example);
+    await waitForTcpConnectable(options.wsPort);
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
 
   const stop = (): Promise<void> => {
     if (child.exitCode !== null) return Promise.resolve();

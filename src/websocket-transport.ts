@@ -18,6 +18,11 @@ import type {
   TransportSession,
 } from './transport.js';
 import { requireNonNegativeFinite } from './validate.js';
+import {
+  DEFAULT_MAX_EXT_HEADER_LEN,
+  DEFAULT_MAX_PAYLOAD_LEN,
+  FIXED_HEADER_LEN,
+} from './constants.js';
 
 export interface WebSocketLike {
   binaryType: string;
@@ -52,15 +57,17 @@ export interface WebSocketConnectorOptions {
   /**
    * Outbound-buffer high-water mark in bytes. `enqueue()` rejects with
    * `BackpressureError` when `bufferedAmount` PLUS this frame would exceed
-   * the mark. The connection stays open. Default 16 MiB; `0` disables.
+   * the mark. The connection stays open. By default it can hold one maximum
+   * Rust 2.0 frame (16 MiB payload plus both headers); `0` disables.
    */
   maxBufferedBytes?: number;
   /** Frame caps, both directions. Defaults mirror the Rust 2.0 defaults. */
   limits?: Partial<DecodeLimits>;
 }
 
-/** Default outbound high-water mark: 16 MiB. */
-export const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+/** Default outbound high-water mark: one maximum Rust 2.0 frame. */
+export const DEFAULT_MAX_BUFFERED_BYTES =
+  FIXED_HEADER_LEN + DEFAULT_MAX_EXT_HEADER_LEN + DEFAULT_MAX_PAYLOAD_LEN;
 
 function defaultWebSocketFactory(
   url: string,

@@ -190,7 +190,7 @@ interface RequestOptions extends SendOptions {
 - 16-byte fixed header, big-endian
 - Three packet types: `OneWay` / `Request` / `Response`
 - Compression is REAL, both directions: zlib via native streams by default, Zstd injectable via the codec SPI; inbound bodies are decompressed at the transport boundary (never handed to the app compressed), outbound compression is applied before enqueue
-- Each WebSocket binary frame carries exactly one Packet — no length-prefix framing is needed at this layer
+- Each WebSocket binary message carries exactly one Packet — no length-prefix framing is needed at this layer
 
 Cross-language conformance is enforced: every release runs the same fixture set on both the Rust crate and this package, and asserts byte-for-byte equality in both directions.
 
@@ -216,3 +216,28 @@ Cross-language conformance is enforced: every release runs the same fixture set 
 ## License
 
 [Apache-2.0](./LICENSE)
+
+### Rust 2.0 interoperability checks
+
+Use the Rust server's WebSocket upgrade URL, including its configured path.
+If you offer a subprotocol, use `protocols: ['msgtrans.v1']`; a default Rust
+listener also accepts clients that offer none. Rust and TypeScript use the
+same binary Packet format and support zlib when the Rust peer is built with
+`flate2`. Do not send zstd to the built-in TypeScript client unless you
+have supplied a zstd codec.
+
+The experimental WebTransport connector requires an HTTP/3 WebTransport
+server. A native MsgTrans QUIC port is not such a server, even though both use
+QUIC and a length-prefixed application stream.
+
+To check a specific Rust checkout or an unpacked `msgtrans-2.0.0.crate`:
+
+```sh
+MSGTRANS_RUST_DIR=/path/to/rust-candidate npm run sync-fixtures -- --check
+MSGTRANS_RUST_DIR=/path/to/rust-candidate npm run test:e2e:all
+```
+
+Set `MSGTRANS_RUST_EXAMPLES_DIR` explicitly to reuse executables built from that
+candidate with `flate2`. The tests no longer pick up cached binaries implicitly.
+The **Rust candidate interop** workflow runs the same checks against a pinned
+Rust commit.

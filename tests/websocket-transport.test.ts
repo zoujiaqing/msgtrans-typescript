@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  BackpressureError,
   Packet,
   PacketType,
   TransportClient,
@@ -11,6 +12,11 @@ import {
   WebSocketConnector,
   type WebSocketLike,
 } from '../src/index.js';
+import {
+  DEFAULT_MAX_EXT_HEADER_LEN,
+  DEFAULT_MAX_PAYLOAD_LEN,
+  FIXED_HEADER_LEN,
+} from '../src/constants.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(__dirname, '..', 'fixtures');
@@ -26,6 +32,7 @@ class MockWebSocket implements WebSocketLike {
   static readonly CLOSED = 3;
 
   binaryType = 'blob';
+  bufferedAmount = 0;
   readyState = MockWebSocket.CONNECTING;
   onopen: ((ev: unknown) => void) | null = null;
   onmessage: ((ev: { data: unknown }) => void) | null = null;
@@ -111,6 +118,23 @@ async function openLink(t: WebSocketConnector, m: MockWebSocket) {
   m.fireOpen();
   return await p;
 }
+
+it('allows one complete Rust-sized frame when the WebSocket buffer is empty', async () => {
+  const mock = new MockWebSocket();
+  const link = await openLink(makeConnector(mock), mock);
+  const packet = new Packet({
+    packetType: PacketType.OneWay,
+    messageId: 1,
+    extHeader: new Uint8Array(DEFAULT_MAX_EXT_HEADER_LEN),
+    payload: new Uint8Array(DEFAULT_MAX_PAYLOAD_LEN),
+  });
+  await link.enqueue(packet);
+  expect(mock.sent[0]?.length).toBe(
+    FIXED_HEADER_LEN + DEFAULT_MAX_EXT_HEADER_LEN + DEFAULT_MAX_PAYLOAD_LEN,
+  );
+  mock.bufferedAmount = 1;
+  await expect(link.enqueue(packet)).rejects.toBeInstanceOf(BackpressureError);
+});
 
 describe('WebSocketConnector — connection lifecycle', () => {
   it('a successful dial yields an OPEN session with arraybuffer binaryType', async () => {
